@@ -151,23 +151,30 @@ install(TARGETS xdg-desktop-portal-hypr-remote
 install(FILES data/hypr-remote.portal
     DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/xdg-desktop-portal/portals"
 )
-# Install D-Bus service file (with proper path substitution)
-#configure_file(data/org.freedesktop.impl.portal.desktop.hypr-remote.service.in 
-#               ${CMAKE_CURRENT_BINARY_DIR}/org.freedesktop.impl.portal.desktop.hypr-remote.service
-#               @ONLY)
-#install(FILES ${CMAKE_CURRENT_BINARY_DIR}/org.freedesktop.impl.portal.desktop.hypr-remote.service
-#    DESTINATION ${CMAKE_INSTALL_DATADIR}/dbus-1/services
-#)
 set(SYSTEMD_SERVICES
     ON
     CACHE BOOL "Install systemd service file")
-include(GNUInstallDirs)
-set(LIBEXECDIR ${CMAKE_INSTALL_FULL_LIBEXECDIR})
+
+# The executable is installed into BINDIR above, so the service files have to
+# point there. They used to be substituted with LIBEXECDIR, which pointed at a
+# path where nothing was ever installed.
+set(BINDIR ${CMAKE_INSTALL_FULL_BINDIR})
+
+# The D-Bus service file is what makes the portal activatable on demand. Without
+# it installed, xdg-desktop-portal fails any RemoteDesktop request with
+# "The name is not activatable" and the backend is never started.
 configure_file(org.freedesktop.impl.portal.desktop.hypr-remote.service.in
                org.freedesktop.impl.portal.desktop.hypr-remote.service @ONLY)
+install(FILES ${CMAKE_CURRENT_BINARY_DIR}/org.freedesktop.impl.portal.desktop.hypr-remote.service
+    DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/dbus-1/services"
+)
+
 if(SYSTEMD_SERVICES)
   configure_file(contrib/systemd/xdg-desktop-portal-hypr-remote.service.in
                  contrib/systemd/xdg-desktop-portal-hypr-remote.service @ONLY)
+  install(FILES ${CMAKE_CURRENT_BINARY_DIR}/contrib/systemd/xdg-desktop-portal-hypr-remote.service
+      DESTINATION "${CMAKE_INSTALL_LIBDIR}/systemd/user"
+  )
 endif()
 
 # Test executable for virtual input

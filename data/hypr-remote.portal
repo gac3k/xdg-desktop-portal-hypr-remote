@@ -1,3 +1,4 @@
 [portal]
 DBusName=org.freedesktop.impl.portal.desktop.hypr-remote
 Interfaces=org.freedesktop.impl.portal.RemoteDesktop
+UseIn=hyprland

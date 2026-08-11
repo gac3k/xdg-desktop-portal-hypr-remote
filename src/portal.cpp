@@ -43,48 +43,69 @@ bool Portal::init(LibEIHandler* handler) {
         connection = sdbus::createSessionBusConnection();
         
         // Request the portal name
-        connection->requestName(PORTAL_NAME);
-        
+        connection->requestName(sdbus::ServiceName{PORTAL_NAME});
+
         // Create the portal object
-        object = sdbus::createObject(*connection, PORTAL_PATH);
+        object = sdbus::createObject(*connection, sdbus::ObjectPath{PORTAL_PATH});
         std::cout << "Portal D-Bus interface registered at " << PORTAL_NAME << std::endl;
         std::cout << "Portal registered on SESSION bus (not system bus)" << std::endl;
         std::cout << "Portal version: 2" << std::endl;
         std::cout << "Portal path: " << PORTAL_PATH << std::endl;
         std::cout << "Portal interface: " << PORTAL_INTERFACE << std::endl;
 
-        // Register RemoteDesktop interface methods with correct signatures
-        object->registerMethod(PORTAL_INTERFACE, "CreateSession", "oosa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { CreateSession(std::move(call)); });
-        
-        /* object->registerMethod(PORTAL_INTERFACE, "SelectSources", "oosa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { SelectSources(std::move(call)); }); */
-        
-        object->registerMethod(PORTAL_INTERFACE, "SelectDevices", "oosa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { SelectDevices(std::move(call)); });
-        
-        object->registerMethod(PORTAL_INTERFACE, "Start", "oossa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { Start(std::move(call)); });
-        
-        // Add the input notification methods that clients call to send input events
-        object->registerMethod(PORTAL_INTERFACE, "NotifyPointerMotion", "oa{sv}dd", "", 
-                              [this](sdbus::MethodCall call) { NotifyPointerMotion(std::move(call)); });
-        
-        object->registerMethod(PORTAL_INTERFACE, "NotifyPointerButton", "oa{sv}iu", "", 
-                              [this](sdbus::MethodCall call) { NotifyPointerButton(std::move(call)); });
-        
-        object->registerMethod(PORTAL_INTERFACE, "NotifyKeyboardKeycode", "oa{sv}iu", "", 
-                              [this](sdbus::MethodCall call) { NotifyKeyboardKeycode(std::move(call)); });
-        
-        object->registerMethod(PORTAL_INTERFACE, "NotifyPointerAxis", "oa{sv}dd", "", 
-                              [this](sdbus::MethodCall call) { NotifyPointerAxis(std::move(call)); });
-        
-        // Modern EIS (Emulated Input Server) method - this is what deskflow actually uses!
-        object->registerMethod(PORTAL_INTERFACE, "ConnectToEIS", "osa{sv}", "h", 
-                              [this](sdbus::MethodCall call) { ConnectToEIS(std::move(call)); });
-        object->registerProperty(PORTAL_INTERFACE, "version", "u", [](sdbus::PropertyGetReply& reply) -> void { reply << (uint)2; });
-        // Finalize the object
-        object->finishRegistration();
+        // Register RemoteDesktop interface methods with correct signatures.
+        //
+        // sdbus-c++ 2.0 replaced the incremental registerMethod()/finishRegistration()
+        // API with a single addVTable().forInterface() call, so every member of the
+        // interface is declared at once. The vtable items are plain aggregates:
+        //   { name, inputSignature, inputParamNames,
+        //     outputSignature, outputParamNames, callback, flags }
+        // Signatures still have to be spelled out by hand because these handlers take
+        // a raw sdbus::MethodCall, which gives sdbus-c++ nothing to deduce them from.
+        auto method = [](const char* name,
+                         const char* inSignature,
+                         const char* outSignature,
+                         sdbus::method_callback handler) {
+            return sdbus::MethodVTableItem{ sdbus::MethodName{name}
+                                          , sdbus::Signature{inSignature}
+                                          , {}
+                                          , sdbus::Signature{outSignature}
+                                          , {}
+                                          , std::move(handler)
+                                          , {} };
+        };
+
+        object->addVTable
+            ( method("CreateSession", "oosa{sv}", "ua{sv}",
+                     [this](sdbus::MethodCall call) { CreateSession(std::move(call)); })
+            /* , method("SelectSources", "oosa{sv}", "ua{sv}",
+                     [this](sdbus::MethodCall call) { SelectSources(std::move(call)); }) */
+            , method("SelectDevices", "oosa{sv}", "ua{sv}",
+                     [this](sdbus::MethodCall call) { SelectDevices(std::move(call)); })
+            , method("Start", "oossa{sv}", "ua{sv}",
+                     [this](sdbus::MethodCall call) { Start(std::move(call)); })
+            // Input notification methods that clients call to send input events
+            , method("NotifyPointerMotion", "oa{sv}dd", "",
+                     [this](sdbus::MethodCall call) { NotifyPointerMotion(std::move(call)); })
+            , method("NotifyPointerButton", "oa{sv}iu", "",
+                     [this](sdbus::MethodCall call) { NotifyPointerButton(std::move(call)); })
+            , method("NotifyKeyboardKeycode", "oa{sv}iu", "",
+                     [this](sdbus::MethodCall call) { NotifyKeyboardKeycode(std::move(call)); })
+            , method("NotifyPointerAxis", "oa{sv}dd", "",
+                     [this](sdbus::MethodCall call) { NotifyPointerAxis(std::move(call)); })
+            // Modern EIS (Emulated Input Server) method - this is what deskflow actually uses!
+            , method("ConnectToEIS", "osa{sv}", "h",
+                     [this](sdbus::MethodCall call) { ConnectToEIS(std::move(call)); })
+            // Version 2 advertises ConnectToEIS, which clients prefer over the
+            // classic Notify* methods. Note that xdg-desktop-portal exposes its
+            // own version to clients regardless of what a backend reports here,
+            // so lowering this number does not steer clients away from EIS.
+            , sdbus::PropertyVTableItem{ sdbus::PropertyName{"version"}
+                                       , sdbus::Signature{"u"}
+                                       , [](sdbus::PropertyGetReply& reply) -> void { reply << (uint)2; }
+                                       , {}
+                                       , {} }
+            ).forInterface(sdbus::InterfaceName{PORTAL_INTERFACE});
         
         std::cout << "Portal D-Bus interface registered at " << PORTAL_NAME << std::endl;
         std::cout << "Portal registered on SESSION bus (not system bus)" << std::endl;
@@ -453,202 +474,81 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
         }
     } catch (const std::exception& e) {
         std::cerr << "Error extracting ConnectToEIS parameters: " << e.what() << std::endl;
-        call.createErrorReply(sdbus::Error("org.freedesktop.portal.Error.Failed", "Failed to extract parameters")).send();
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to extract parameters")).send();
         return;
     }
     
     if (!libei_handler || !libei_handler->keyboard || !libei_handler->pointer) {
         std::cerr << "Virtual devices not available" << std::endl;
-        call.createErrorReply(sdbus::Error("org.freedesktop.portal.Error.Failed", "Virtual devices not available")).send();
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Virtual devices not available")).send();
         return;
     }
     
-    // Create a socket pair - one end for deskflow, one end for our EIS server
-    int socket_pair[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, socket_pair) == -1) {
-        std::cerr << "Error creating socket pair: " << strerror(errno) << std::endl;
-        call.createErrorReply(sdbus::Error("org.freedesktop.portal.Error.Failed", "Failed to create socket pair")).send();
+    // Set up the EIS context on a private, pre-connected file descriptor.
+    //
+    // eis_setup_backend_fd() + eis_backend_fd_add_client() hand us an fd that is
+    // already wired to this client; we pass it straight back over D-Bus. The
+    // alternative, eis_setup_backend_socket(), is documented as being "primarily
+    // useful for testing and debugging" and needs a named socket plus a lockfile,
+    // which is what used to collide with itself here ("is another EIS running?")
+    // and left the handshake stuck before EIS_EVENT_CLIENT_CONNECT.
+    struct eis* eis_context = eis_new(nullptr);
+    if (!eis_context) {
+        std::cerr << "Failed to create EIS server context" << std::endl;
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to create EIS context")).send();
         return;
     }
-    
-    int client_fd = socket_pair[0];  // This goes to deskflow
-    int server_fd = socket_pair[1];  // This stays with us for EIS server
-    
-    std::cout << "✅ Created socket pair - client_fd: " << client_fd << ", server_fd: " << server_fd << std::endl;
-    
-    // Start a thread to run a proper EIS server
-    std::thread([this, server_fd]() {
-        std::cout << "📡 Starting proper EIS server thread..." << std::endl;
-        
-        // Create EIS server context (similar to hyprland-eis)
-        struct eis* eis_context = eis_new(nullptr);
-        if (!eis_context) {
-            std::cerr << "Failed to create EIS server context" << std::endl;
-            close(server_fd);
-            return;
-        }
-        
-        // Set up logging (optional, for debugging)
-        // eis_log_set_priority(eis_context, EIS_LOG_PRIORITY_DEBUG);
-        
-        std::cout << "✅ EIS server context created" << std::endl;
-        
-        // Create a temporary socket and immediately connect our FD to it
-        // This is a workaround since libeis may not support direct FD setup
-        
-        // Alternative approach: Create a proper EIS server socket and handle the connection
-        char socket_path[256];
-        snprintf(socket_path, sizeof(socket_path), "/tmp/hypr-portal-eis-%d", getpid());
-        
-        // Setup EIS backend with temporary socket
-        int rc = eis_setup_backend_socket(eis_context, socket_path);
-        if (rc != 0) {
-            std::cerr << "Failed to setup EIS backend socket: " << strerror(errno) << std::endl;
-            eis_unref(eis_context);
-            close(server_fd);
-            return;
-        }
-        
-        std::cout << "✅ EIS backend socket created at: " << socket_path << std::endl;
-        
-        // Now we need to bridge between our socket_pair and the EIS socket
-        // Start a bridge thread to forward data between them
-        std::thread bridge_thread([server_fd, socket_path]() {
-            std::cout << "🌉 Starting socket bridge..." << std::endl;
-            
-            // Connect to the EIS socket
-            int eis_sock = socket(AF_UNIX, SOCK_STREAM, 0);
-            if (eis_sock == -1) {
-                std::cerr << "Failed to create bridge socket" << std::endl;
-                return;
-            }
-            
-            struct sockaddr_un addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sun_family = AF_UNIX;
-            strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
-            
-            // Wait a bit for the EIS server to start
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            
-            if (connect(eis_sock, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-                std::cerr << "Failed to connect to EIS socket: " << strerror(errno) << std::endl;
-                close(eis_sock);
-                return;
-            }
-            
-            std::cout << "✅ Bridge connected to EIS socket" << std::endl;
-            
-            // Bridge data bidirectionally between server_fd and eis_sock
-            fd_set read_fds;
-            char buffer[4096];
-            
-            // Make sockets non-blocking for better performance
-            int flags = fcntl(server_fd, F_GETFL, 0);
-            fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
-            flags = fcntl(eis_sock, F_GETFL, 0);
-            fcntl(eis_sock, F_SETFL, flags | O_NONBLOCK);
-            
-            while (true) {
-                FD_ZERO(&read_fds);
-                FD_SET(server_fd, &read_fds);
-                FD_SET(eis_sock, &read_fds);
-                
-                int max_fd = std::max(server_fd, eis_sock);
-                struct timeval timeout = {0, 100000}; // 100ms timeout for better responsiveness
-                
-                int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &timeout);
-                
-                if (activity < 0) {
-                    std::cerr << "Bridge select error: " << strerror(errno) << std::endl;
-                    break;
-                }
-                
-                if (activity == 0) continue; // timeout
-                
-                // Forward data from deskflow (server_fd) to EIS server (eis_sock)
-                if (FD_ISSET(server_fd, &read_fds)) {
-                    ssize_t bytes = read(server_fd, buffer, sizeof(buffer));
-                    if (bytes <= 0) {
-                        if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                            std::cout << "Deskflow disconnected from bridge" << std::endl;
-                            break;
-                        }
-                    } else {
-                        if (write(eis_sock, buffer, bytes) != bytes) {
-                            std::cerr << "Failed to forward data to EIS server" << std::endl;
-                            break;
-                        }
-                        //std::cout << "🔄 Forwarded " << bytes << " bytes from deskflow to EIS" << std::endl;
-                    }
-                }
-                
-                // Forward data from EIS server (eis_sock) to deskflow (server_fd)
-                if (FD_ISSET(eis_sock, &read_fds)) {
-                    ssize_t bytes = read(eis_sock, buffer, sizeof(buffer));
-                    if (bytes <= 0) {
-                        if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                            std::cout << "EIS server disconnected from bridge" << std::endl;
-                            break;
-                        }
-                    } else {
-                        if (write(server_fd, buffer, bytes) != bytes) {
-                            std::cerr << "Failed to forward data to deskflow" << std::endl;
-                            break;
-                        }
-                        //std::cout << "🔄 Forwarded " << bytes << " bytes from EIS to deskflow" << std::endl;
-                    }
-                }
-            }
-            
-            std::cout << "🌉 Socket bridge stopped" << std::endl;
-            close(eis_sock);
-        });
-        bridge_thread.detach();
-        
-        // Run the EIS server event loop (adapted from hyprland-eis)
+
+    if (eis_setup_backend_fd(eis_context) != 0) {
+        std::cerr << "Failed to set up EIS fd backend: " << strerror(errno) << std::endl;
+        eis_unref(eis_context);
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to set up EIS backend")).send();
+        return;
+    }
+
+    int client_fd = eis_backend_fd_add_client(eis_context);
+    if (client_fd < 0) {
+        std::cerr << "Failed to add EIS client: " << strerror(-client_fd) << std::endl;
+        eis_unref(eis_context);
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to add EIS client")).send();
+        return;
+    }
+
+    std::cout << "✅ EIS client fd created: " << client_fd << std::endl;
+
+    // Run the EIS event loop. handle_eis_event() answers CLIENT_CONNECT by
+    // creating the seat and its devices, and translates pointer/keyboard events
+    // onto the Wayland virtual devices.
+    std::thread([this, eis_context]() {
         std::cout << "🚀 Starting EIS server event loop..." << std::endl;
-        
-        bool stop = false;
+
         struct pollfd fds = {
             .fd = eis_get_fd(eis_context),
             .events = POLLIN,
             .revents = 0,
         };
-        
-        while (!stop) {
-            int nevents = poll(&fds, 1, 100); // Reduced timeout to 100ms for better responsiveness
+
+        while (true) {
+            int nevents = poll(&fds, 1, 100);
             if (nevents == -1) {
+                if (errno == EINTR) continue;
                 std::cerr << "EIS poll error: " << strerror(errno) << std::endl;
                 break;
             }
-            
+
             if (nevents == 0) continue; // timeout
-            
-            // Process all pending EIS events in one go - this is crucial for scroll
+
             eis_dispatch(eis_context);
-            
-            // Handle ALL events in the queue immediately
+
             struct eis_event* event;
-            int event_count = 0;
             while ((event = eis_get_event(eis_context)) != nullptr) {
-                event_count++;
-                //std::cout << "🎯 EIS: Processing event " << event_count << " type=" << eis_event_get_type(event) << std::endl;
-                
-                // Handle EIS events and forward to virtual devices
                 handle_eis_event(event);
                 eis_event_unref(event);
             }
-            
-            if (event_count > 0) {
-                std::cout << "📊 EIS: Processed " << event_count << " events in this cycle" << std::endl;
-            }
         }
-        
+
         std::cout << "📡 EIS server thread stopped" << std::endl;
-        unlink(socket_path); // Clean up socket file
         eis_unref(eis_context);
-        close(server_fd);
     }).detach();
     
     // Return the client file descriptor to deskflow
@@ -659,9 +559,7 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
     reply << unix_fd;
     reply.send();
     
-    std::cout << "✅ ConnectToEIS completed - socket fd sent to deskflow" << std::endl;
-    std::cout << "🎯 Deskflow can now send EIS events through fd " << client_fd << std::endl;
-    std::cout << "📡 Proper EIS server thread is running with socket bridge" << std::endl;
+    std::cout << "✅ ConnectToEIS completed - EIS fd " << client_fd << " sent to client" << std::endl;
 }
 
 void Portal::handle_eis_event(struct eis_event* event) {
