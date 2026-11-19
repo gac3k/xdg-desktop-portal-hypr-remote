@@ -15,8 +15,10 @@
  *    (else -1), read_events or cancel_read, dispatch_pending, drain the eventfd and
  *    run queued commands, flush, expire deadlines. Other threads only lock `mtx`,
  *    push a Command (Claim, Receive, Announce, SessionEnded, Stop) and write the
- *    eventfd. On exit the thread closes every pending fd, destroys all Wayland
- *    objects and disconnects.
+ *    eventfd. On exit (Stop, or a fatal display error, which also clears
+ *    available) the thread sets loop_exited_, closes every pending and queued fd,
+ *    destroys all Wayland objects and disconnects; a command pushed after that has
+ *    its fd closed at once.
  *  - Portal: the D-Bus side. Its handlers run on the sdbus event-loop thread. It
  *    owns the session table and turns the callbacks below into signals.
  *
@@ -167,11 +169,22 @@ public:
     void session_ended();                             // fail pending transfers, drop our source
 
 private:
+    struct Listeners;                                 // static Wayland listener callbacks
     struct Pending { int fd; std::string mime; std::chrono::steady_clock::time_point deadline; };
     struct Command { enum Kind { Claim, Receive, Announce, SessionEnded, Stop } kind;
-                     std::vector<std::string> mimes; int fd = -1; };
+                     std::vector<std::string> mimes; int fd = -1; };   // Receive: mimes = {mime}
+    static constexpr std::chrono::seconds kTransferTimeout{5};
 
     void run();                                       // the Wayland thread
+    void push_command(Command cmd);                   // closes cmd.fd if the loop has exited
+    void wake();                                      // write the eventfd
+    void run_command(Command& cmd, bool& stop_requested);
+    void on_selection(ext_data_control_offer_v1* offer);
+    void on_send(ext_data_control_source_v1* source, const char* mime, int fd);
+    void destroy_offer(ext_data_control_offer_v1* offer);
+    void expire_pending();
+    int  poll_timeout_ms();
+    void teardown_wayland();                          // Wayland thread, or init() before it starts
 
     ClipboardCallbacks cb_;
     std::atomic<bool> available_{false};
@@ -179,6 +192,7 @@ private:
     int event_fd_ = -1;
 
     std::mutex mtx_;                                  // guards everything below
+    bool loop_exited_ = true;                         // no thread to run commands: close fds at once
     std::deque<Command> commands_;
     std::map<uint32_t, Pending> pending_;
     uint32_t serial_counter_ = 0;
