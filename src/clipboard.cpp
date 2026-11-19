@@ -190,6 +190,12 @@ void WaylandClipboard::write_done(uint32_t serial, bool ok) {
     std::lock_guard<std::mutex> lock(mtx_);
     auto it = pending_.find(serial);
     if (it == pending_.end()) {
+        if (std::find(failed_serials_.begin(), failed_serials_.end(), serial) !=
+            failed_serials_.end()) {
+            std::cout << "clipboard: remote->local serial " << serial
+                      << " done after it had already failed (paste got no data)" << std::endl;
+            return;
+        }
         // Normal case: the fd was handed over by SelectionWrite.
         std::cout << "clipboard: remote->local serial " << serial
                   << (ok ? " done ok" : " failed") << std::endl;
@@ -233,6 +239,7 @@ void WaylandClipboard::session_ended() {
         for (auto& [serial, p] : pending_) {
             std::cout << "clipboard: remote->local " << p.mime << " serial " << serial
                       << " failed (session ended)" << std::endl;
+            note_failed(serial);
             close(p.fd);
         }
         pending_.clear();
@@ -373,6 +380,11 @@ void WaylandClipboard::run_command(Command& cmd, bool& stop_requested) {
     }
 }
 
+void WaylandClipboard::note_failed(uint32_t serial) {
+    failed_serials_.push_back(serial);
+    while (failed_serials_.size() > 32) failed_serials_.pop_front();
+}
+
 void WaylandClipboard::expire_pending() {
     auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(mtx_);
@@ -380,6 +392,7 @@ void WaylandClipboard::expire_pending() {
         if (it->second.deadline <= now) {
             std::cout << "clipboard: remote->local " << it->second.mime << " serial "
                       << it->first << " timed out" << std::endl;
+            note_failed(it->first);
             close(it->second.fd);
             it = pending_.erase(it);
         } else {
@@ -448,7 +461,10 @@ done:
     {
         std::lock_guard<std::mutex> lock(mtx_);
         loop_exited_ = true;
-        for (auto& [serial, p] : pending_) close(p.fd);
+        for (auto& [serial, p] : pending_) {
+            note_failed(serial);
+            close(p.fd);
+        }
         pending_.clear();
         for (auto& c : commands_)
             if (c.fd >= 0) close(c.fd);

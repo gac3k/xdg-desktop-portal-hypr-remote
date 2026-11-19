@@ -52,7 +52,8 @@
  *  - The clipboard session is the most recently Started entry that requested the clipboard,
  *    kept as `clip_session` ("" = none). Only it receives signals and may use the
  *    clipboard methods. Any other handle gets org.freedesktop.portal.Error.Failed.
- *    When it closes: clip_session = "" and clipboard->session_ended(). Entries left
+ *    When it closes, or another session's Start replaces it: clip_session = ... and
+ *    clipboard->session_ended(). Entries left
  *    behind by a frontend crash (no Close) are harmless; the next Start takes over.
  *
  * 4. MAC -> LAPTOP (Synergy owns the selection)
@@ -184,6 +185,7 @@ private:
     void on_send(ext_data_control_source_v1* source, const char* mime, int fd);
     void destroy_offer(ext_data_control_offer_v1* offer);
     void expire_pending();
+    void note_failed(uint32_t serial);                // mtx_ held
     int  poll_timeout_ms();
     void teardown_wayland();                          // Wayland thread, or init() before it starts
 
@@ -196,6 +198,7 @@ private:
     bool loop_exited_ = true;                         // no thread to run commands: close fds at once
     std::deque<Command> commands_;
     std::map<uint32_t, Pending> pending_;
+    std::deque<uint32_t> failed_serials_;             // recently closed without a hand-over, max 32
     uint32_t serial_counter_ = 0;
     std::vector<std::string> foreign_mimes_;          // copy of the current foreign offer's types
 

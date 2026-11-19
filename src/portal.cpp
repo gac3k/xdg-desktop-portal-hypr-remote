@@ -456,9 +456,16 @@ void Portal::Start(sdbus::MethodCall call) {
     reply.send();
 
     if (clipboard_enabled) {
+        std::string previous;
         {
             std::lock_guard<std::mutex> lock(sessions_mtx);
+            previous = clip_session;
             clip_session = session_handle;
+        }
+        if (!previous.empty() && previous != std::string(session_handle)) {
+            std::cout << "clipboard: session " << previous << " replaced by "
+                      << session_handle << std::endl;
+            clipboard->session_ended();  // before announce(): commands run in FIFO order
         }
         clipboard->announce();
     }
