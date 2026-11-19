@@ -64,7 +64,6 @@ int main(int argc, char* argv[]) {
     
     std::cout << "✓ LibEI handler started and ready for connections" << std::endl;
     
-    // Initialize portal
     // Initialize portal; it also initializes the clipboard (clipboard.h, item 9)
     if (!portal.init(&libeiHandler, &clipboard)) {
         std::cerr << "Failed to initialize D-Bus portal" << std::endl;

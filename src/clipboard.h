@@ -40,7 +40,7 @@
  *  - `object` must outlive the thread: clipboard.stop() runs before portal.cleanup().
  *
  * 3. SESSIONS (Portal): std::map<std::string, SessionState> under sessions_mtx,
- *    SessionState{bool clipboard_requested, started; unique_ptr<IObject> obj}.
+ *    SessionState{bool clipboard_requested; unique_ptr<IObject> obj}.
  *  - xdg-desktop-portal 1.22.1 (src/xdp-session.c, xdp_session_close) calls
  *    impl.portal.Session.Close synchronously at session_handle, both on Close and
  *    when the client disconnects. Today that gets UnknownObject. Decision:
@@ -49,7 +49,7 @@
  *    obj into `retired`, because an object must not be destroyed inside its own
  *    callback. `retired` is cleared at the next CreateSession.
  *  - RequestClipboard and Start on an unknown handle create the entry.
- *  - The clipboard session is the most recently Started entry with both flags set,
+ *  - The clipboard session is the most recently Started entry that requested the clipboard,
  *    kept as `clip_session` ("" = none). Only it receives signals and may use the
  *    clipboard methods. Any other handle gets org.freedesktop.portal.Error.Failed.
  *    When it closes: clip_session = "" and clipboard->session_ended(). Entries left

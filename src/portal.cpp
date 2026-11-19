@@ -22,6 +22,7 @@ extern "C" {
 #include <libei.h>
 #include "libei-1.0/libeis.h"
 #include <wayland-client-protocol.h>
+}
 
 // ---- Monitor layout (hypr-remote local patch) ----------------------------
 // Synergy/Deskflow sends absolute positions within one rectangle. Hyprland
@@ -172,7 +173,6 @@ void track_absolute(const Layout& layout, double& x, double& y) {
     g_abs = {true, rx, ry, x, y};
 }
 } // namespace
-}
 
 static const char* PORTAL_INTERFACE = "org.freedesktop.impl.portal.RemoteDesktop";
 static const char* PORTAL_PATH = "/org/freedesktop/portal/desktop";
@@ -187,7 +187,7 @@ static void reply_failed(sdbus::MethodCall& call, const std::string& message) {
 // Use development name if requested, otherwise use standard name
 static const char* PORTAL_NAME = "org.freedesktop.impl.portal.desktop.hypr-remote";
 
-Portal::Portal() : libei_handler(nullptr), running(false) {
+Portal::Portal() : libei_handler(nullptr) {
 }
 
 Portal::~Portal() {
@@ -214,26 +214,6 @@ bool Portal::init(LibEIHandler* handler, WaylandClipboard* clip) {
         std::cout << "Portal interface: " << PORTAL_INTERFACE << std::endl;
 
         // Register RemoteDesktop interface methods with correct signatures
-        
-        
-        /*  */
-        
-        
-        
-        
-        
-        // Add the input notification methods that clients call to send input events
-        
-        
-        
-        
-        
-        
-        
-        
-        // Modern EIS (Emulated Input Server) method - this is what deskflow actually uses!
-        
-        
         // Finalize the object
         object->addVTable(
             sdbus::MethodVTableItem{sdbus::MethodName{"CreateSession"}, sdbus::Signature{"oosa{sv}"}, {}, sdbus::Signature{"ua{sv}"}, {}, [this](sdbus::MethodCall call) { CreateSession(std::move(call)); }, {}},
@@ -258,9 +238,6 @@ bool Portal::init(LibEIHandler* handler, WaylandClipboard* clip) {
             sdbus::SignalVTableItem{sdbus::SignalName{"SelectionTransfer"}, sdbus::Signature{"osu"}, {}, {}},
             sdbus::PropertyVTableItem{sdbus::PropertyName{"version"}, sdbus::Signature{"u"}, [](sdbus::PropertyGetReply& reply) { reply << (uint32_t)1; }, {}, {}}
         ).forInterface(sdbus::InterfaceName{CLIPBOARD_INTERFACE});
-        
-        std::cout << "Portal D-Bus interface registered at " << PORTAL_NAME << std::endl;
-        std::cout << "Portal registered on SESSION bus (not system bus)" << std::endl;
     } catch (const sdbus::Error& e) {
         std::cerr << "Failed to initialize D-Bus portal: " << e.what() << std::endl;
         std::cerr << "This is normal if another portal is already running or if running outside a desktop session." << std::endl;
@@ -280,8 +257,6 @@ bool Portal::init(LibEIHandler* handler, WaylandClipboard* clip) {
 }
 
 void Portal::cleanup() {
-    running = false;
-
     // Session objects must go before the connection. The clipboard thread has
     // been stopped by now (main stops it before cleanup()). Destroy them outside
     // sessions_mtx: destroying an object takes the sdbus lock, and method
@@ -309,8 +284,6 @@ void Portal::cleanup() {
 void Portal::run() {
     if (!connection) return;
     
-    running = true;
-    
     std::cout << "🔄 Starting proper sdbus D-Bus event loop..." << std::endl;
     std::cout << "📡 Portal ready to receive D-Bus calls!" << std::endl;
     
@@ -326,7 +299,6 @@ void Portal::run() {
 }
 
 void Portal::stop() {
-    running = false;
     // Exit the sdbus event loop cleanly
     if (connection) {
         connection->leaveEventLoop();
@@ -376,32 +348,6 @@ void Portal::CreateSession(sdbus::MethodCall call) {
     
     std::cout << "✅ CreateSession completed successfully" << std::endl;
     std::cout << "📋 NEXT: Client should call SelectDevices or Start" << std::endl;
-}
-
-void Portal::SelectSources(sdbus::MethodCall call) {
-    std::cout << "🔥 RemoteDesktop SelectSources called!" << std::endl;
-    
-    // Extract parameters
-    sdbus::ObjectPath session_handle;
-    std::map<std::string, sdbus::Variant> options;
-    call >> session_handle >> options;
-    
-    std::cout << "Session handle: " << session_handle << std::endl;
-    std::cout << "Options received:" << std::endl;
-    for (const auto& option : options) {
-        std::cout << "  " << option.first << std::endl;
-    }
-    
-    // Response - allow all sources
-    std::map<std::string, sdbus::Variant> response;
-    response["types"] = sdbus::Variant(static_cast<uint32_t>(7)); // keyboard | pointer | touchscreen
-    
-    auto reply = call.createReply();
-    reply << static_cast<uint32_t>(0); // Success
-    reply << response;
-    reply.send();
-    
-    std::cout << "✅ SelectSources completed for session: " << session_handle << std::endl;
 }
 
 void Portal::SelectDevices(sdbus::MethodCall call) {
@@ -499,7 +445,6 @@ void Portal::Start(sdbus::MethodCall call) {
     {
         std::lock_guard<std::mutex> lock(sessions_mtx);
         auto& state = sessions[session_handle];
-        state.started = true;
         clipboard_enabled = clipboard_enabled && state.clipboard_requested;
     }
     if (clipboard_enabled) response["clipboard_enabled"] = sdbus::Variant(true);
@@ -722,7 +667,7 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
             struct sockaddr_un addr;
             memset(&addr, 0, sizeof(addr));
             addr.sun_family = AF_UNIX;
-            strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+            snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
             
             // Wait a bit for the EIS server to start
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -1252,7 +1197,7 @@ void Portal::SessionClose(sdbus::MethodCall call, const std::string& session_han
 bool Portal::is_clip_session(const std::string& session_handle) {
     if (!clipboard || !clipboard->available()) return false;
     std::lock_guard<std::mutex> lock(sessions_mtx);
-    return !clip_session.empty() && clip_session == session_handle;
+    return clip_session == session_handle;
 }
 
 void Portal::RequestClipboard(sdbus::MethodCall call) {

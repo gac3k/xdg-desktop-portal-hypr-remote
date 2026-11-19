@@ -30,13 +30,11 @@ private:
     std::unique_ptr<sdbus::IObject> object;
     LibEIHandler* libei_handler;
     WaylandClipboard* clipboard = nullptr;
-    bool running;
 
     // Session table (clipboard.h, item 3). Never call into `clipboard` or emit a
     // signal while holding sessions_mtx.
     struct SessionState {
         bool clipboard_requested = false;
-        bool started = false;
         std::unique_ptr<sdbus::IObject> obj;   // org.freedesktop.impl.portal.Session
     };
     std::mutex sessions_mtx;
@@ -62,7 +60,6 @@ private:
     
     // D-Bus method handlers
     void CreateSession(sdbus::MethodCall call);
-    void SelectSources(sdbus::MethodCall call);
     void SelectDevices(sdbus::MethodCall call);
     void Start(sdbus::MethodCall call);
     

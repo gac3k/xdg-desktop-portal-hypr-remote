@@ -160,18 +160,6 @@ void WaylandClipboard::stop() {
         thread_.join();
     }
     available_ = false;
-    // Anything queued after the loop exited (push_command closes those itself)
-    // or left behind is closed here.
-    std::deque<Command> leftover;
-    {
-        std::lock_guard<std::mutex> lock(mtx_);
-        loop_exited_ = true;
-        leftover.swap(commands_);
-        for (auto& [serial, p] : pending_) close(p.fd);
-        pending_.clear();
-    }
-    for (auto& c : leftover)
-        if (c.fd >= 0) close(c.fd);
     if (event_fd_ >= 0) {
         close(event_fd_);
         event_fd_ = -1;
