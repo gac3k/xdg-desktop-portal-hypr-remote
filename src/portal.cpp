@@ -524,9 +524,6 @@ void Portal::Start(sdbus::MethodCall call) {
 }
 
 void Portal::NotifyPointerMotion(sdbus::MethodCall call) {
-    std::cout << "🖱️ NotifyPointerMotion called!" << std::endl;
-    std::cout << "📋 FLOW: Step 4/4 - Input events (Mouse Motion)" << std::endl;
-    std::cout << "🎯 DESKFLOW IS USING LEGACY NOTIFY METHODS!" << std::endl;
     
     // Extract parameters
     sdbus::ObjectPath session_handle;
@@ -534,7 +531,6 @@ void Portal::NotifyPointerMotion(sdbus::MethodCall call) {
     double dx, dy;
     call >> session_handle >> options >> dx >> dy;
     
-    std::cout << "Session: " << session_handle << ", Motion: dx=" << dx << ", dy=" << dy << std::endl;
     
     // Get current time for wayland events
     uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -544,9 +540,6 @@ void Portal::NotifyPointerMotion(sdbus::MethodCall call) {
     if (libei_handler && libei_handler->pointer) {
         libei_handler->pointer->send_motion(time, dx, dy);
         libei_handler->pointer->send_frame();
-        std::cout << "✅ Motion forwarded to virtual pointer" << std::endl;
-    } else {
-        std::cout << "❌ No virtual pointer available" << std::endl;
     }
     
     auto reply = call.createReply();
@@ -554,7 +547,6 @@ void Portal::NotifyPointerMotion(sdbus::MethodCall call) {
 }
 
 void Portal::NotifyPointerButton(sdbus::MethodCall call) {
-    std::cout << "🖱️ NotifyPointerButton called!" << std::endl;
     
     // Extract parameters
     sdbus::ObjectPath session_handle;
@@ -563,7 +555,6 @@ void Portal::NotifyPointerButton(sdbus::MethodCall call) {
     uint32_t state;
     call >> session_handle >> options >> button >> state;
     
-    std::cout << "Session: " << session_handle << ", Button: " << button << ", State: " << state << std::endl;
     
     // Get current time for wayland events
     uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -573,9 +564,6 @@ void Portal::NotifyPointerButton(sdbus::MethodCall call) {
     if (libei_handler && libei_handler->pointer) {
         libei_handler->pointer->send_button(time, static_cast<uint32_t>(button), state);
         libei_handler->pointer->send_frame();
-        std::cout << "✅ Button event forwarded to virtual pointer" << std::endl;
-    } else {
-        std::cout << "❌ No virtual pointer available" << std::endl;
     }
     
     auto reply = call.createReply();
@@ -583,7 +571,6 @@ void Portal::NotifyPointerButton(sdbus::MethodCall call) {
 }
 
 void Portal::NotifyKeyboardKeycode(sdbus::MethodCall call) {
-    std::cout << "⌨️ NotifyKeyboardKeycode called!" << std::endl;
     
     // Extract parameters
     sdbus::ObjectPath session_handle;
@@ -592,7 +579,6 @@ void Portal::NotifyKeyboardKeycode(sdbus::MethodCall call) {
     uint32_t state;
     call >> session_handle >> options >> keycode >> state;
     
-    std::cout << "Session: " << session_handle << ", Keycode: " << keycode << ", State: " << state << std::endl;
     
     // Get current time for wayland events
     uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -601,9 +587,6 @@ void Portal::NotifyKeyboardKeycode(sdbus::MethodCall call) {
     // Forward to virtual keyboard
     if (libei_handler && libei_handler->keyboard) {
         libei_handler->keyboard->send_key(time, static_cast<uint32_t>(keycode), state);
-        std::cout << "✅ Key event forwarded to virtual keyboard" << std::endl;
-    } else {
-        std::cout << "❌ No virtual keyboard available" << std::endl;
     }
     
     auto reply = call.createReply();
@@ -611,7 +594,6 @@ void Portal::NotifyKeyboardKeycode(sdbus::MethodCall call) {
 }
 
 void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
-    std::cout << "🖱️ NotifyPointerAxis called!" << std::endl;
     
     // Extract parameters
     sdbus::ObjectPath session_handle;
@@ -619,7 +601,6 @@ void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
     double dx, dy;
     call >> session_handle >> options >> dx >> dy;
     
-    std::cout << "Session: " << session_handle << ", Axis: dx=" << dx << ", dy=" << dy << std::endl;
     
     // Get current time for wayland events
     uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -640,9 +621,6 @@ void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
             libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_VERTICAL_SCROLL);
         }
         libei_handler->pointer->send_frame();
-        std::cout << "✅ Legacy axis event forwarded with proper scroll protocol" << std::endl;
-    } else {
-        std::cout << "❌ No virtual pointer available" << std::endl;
     }
     
     auto reply = call.createReply();
@@ -848,20 +826,13 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
             
             // Handle ALL events in the queue immediately
             struct eis_event* event;
-            int event_count = 0;
             while ((event = eis_get_event(eis_context)) != nullptr) {
-                event_count++;
-                //std::cout << "🎯 EIS: Processing event " << event_count << " type=" << eis_event_get_type(event) << std::endl;
                 
                 // Handle EIS events and forward to virtual devices
                 bool client_gone = eis_event_get_type(event) == EIS_EVENT_CLIENT_DISCONNECT;
                 handle_eis_event(event);
                 eis_event_unref(event);
                 if (client_gone) stop = true;
-            }
-            
-            if (event_count > 0) {
-                std::cout << "📊 EIS: Processed " << event_count << " events in this cycle" << std::endl;
             }
         }
         
@@ -1012,7 +983,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
             double dx = eis_event_pointer_get_dx(event);
             double dy = eis_event_pointer_get_dy(event);
             
-            std::cout << "🖱️ EIS: Pointer motion dx=" << dx << " dy=" << dy << std::endl;
             
             // Forward to virtual pointer
             if (libei_handler && libei_handler->pointer) {
@@ -1020,7 +990,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                 libei_handler->pointer->send_motion(time, dx, dy);
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Motion forwarded to virtual pointer" << std::endl;
             }
             break;
         }
@@ -1029,7 +998,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
             double x = eis_event_pointer_get_absolute_x(event);
             double y = eis_event_pointer_get_absolute_y(event);
             
-            std::cout << "🖱️ EIS: Pointer absolute motion x=" << x << " y=" << y << std::endl;
             
             // Forward to virtual pointer  
             if (libei_handler && libei_handler->pointer) {
@@ -1041,7 +1009,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
                     static_cast<uint32_t>(std::lround(x)), static_cast<uint32_t>(std::lround(y)),
                     static_cast<uint32_t>(layout.width), static_cast<uint32_t>(layout.height));
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Absolute motion forwarded to virtual pointer" << std::endl;
             }
             break;
         }
@@ -1050,7 +1017,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
             uint32_t button = eis_event_button_get_button(event);
             bool is_press = eis_event_button_get_is_press(event);
             
-            std::cout << "🖱️ EIS: Button " << (is_press ? "press" : "release") << " button=" << button << std::endl;
             
             // Forward to virtual pointer
             if (libei_handler && libei_handler->pointer) {
@@ -1058,7 +1024,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                 libei_handler->pointer->send_button(time, button, is_press ? 1 : 0);
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Button event forwarded to virtual pointer" << std::endl;
             }
             break;
         }
@@ -1067,18 +1032,14 @@ void Portal::handle_eis_event(struct eis_event* event) {
             double dx = eis_event_scroll_get_dx(event);
             double dy = eis_event_scroll_get_dy(event);
             
-            std::cout << "🖱️ EIS: Scroll delta dx=" << dx << " dy=" << dy << std::endl;
             
             // Debug: Check if we have the required components
-            std::cout << "🔍 DEBUG: libei_handler=" << (libei_handler ? "YES" : "NO") 
-                      << ", pointer=" << (libei_handler && libei_handler->pointer ? "YES" : "NO") << std::endl;
             
             // Forward to virtual pointer with proper Wayland scroll protocol
             if (libei_handler && libei_handler->pointer) {
                 uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                 
-                std::cout << "🎯 Sending scroll events with time=" << time << std::endl;
                 
                 // Set axis source - wheel is the most common source for EIS scroll events
                 libei_handler->pointer->send_axis_source(WL_POINTER_AXIS_SOURCE_WHEEL);
@@ -1087,21 +1048,16 @@ void Portal::handle_eis_event(struct eis_event* event) {
                 double scale_factor = 15.0; // Good default for smooth scrolling
                 
                 if (dx != 0.0) {
-                    std::cout << "🔄 Sending horizontal scroll: " << (dx * scale_factor) << std::endl;
                     libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx * scale_factor, dy);
                     // Send axis stop to complete the scroll event
                     libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
                 }
                 if (dy != 0.0) {
-                    std::cout << "🔄 Sending vertical scroll: " << (dy * scale_factor) << std::endl;
                     libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dx * scale_factor, dy);
                     // Send axis stop to complete the scroll event  
                     libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_VERTICAL_SCROLL);
                 }
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Scroll delta forwarded with proper axis protocol" << std::endl;
-            } else {
-                std::cout << "❌ Cannot forward scroll - missing virtual pointer!" << std::endl;
             }
             break;
         }
@@ -1117,7 +1073,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
                 //std::cout << "🔄 Discrete values are 0, assuming vertical scroll step: dy=" << dy << std::endl;
             }
 
-            std::cout << "🖱️ EIS: Scroll discrete dx=" << dx << " dy=" << dy << std::endl;
             
             // If discrete values are 0, assume vertical scroll with 1 step (common case)
                         
@@ -1136,9 +1091,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
                 // libei_handler->pointer->send_axis_stop(time, axis);
             
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Scroll discrete forwarded (steps=" << dx << "," << dy << ")" << std::endl;
-            } else {
-                std::cout << "❌ No scroll to forward (dx=" << dx << " dy=" << dy << ") or no pointer available" << std::endl;
             }
             break;
         }
@@ -1147,24 +1099,18 @@ void Portal::handle_eis_event(struct eis_event* event) {
             uint32_t keycode = eis_event_keyboard_get_key(event);
             bool is_press = eis_event_keyboard_get_key_is_press(event);
             
-            std::cout << "⌨️ EIS: Keyboard " << (is_press ? "press" : "release") << " keycode=" << keycode << std::endl;
             
             // Debug: Check if we have the required components
-            std::cout << "🔍 DEBUG: libei_handler=" << (libei_handler ? "YES" : "NO") 
-                      << ", keyboard=" << (libei_handler && libei_handler->keyboard ? "YES" : "NO") << std::endl;
             
             // Forward to virtual keyboard with immediate modifier updates
             if (libei_handler && libei_handler->keyboard) {
                 uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                     
-                std::cout << "🎯 Processing key event with time=" << time << std::endl;
                 
                 // Update modifier state BEFORE sending the key event (using raw keycode)
                 update_modifier_state(keycode, is_press);
                 
-                std::cout << "🔧 Current modifier state: depressed=" << modifier_state_depressed 
-                         << ", latched=" << modifier_state_latched << ", locked=" << modifier_state_locked << std::endl;
                 
                 // Send modifier state first - this is crucial for key combinations like Meta+Enter
                 libei_handler->keyboard->send_modifiers(modifier_state_depressed, 
@@ -1181,17 +1127,12 @@ void Portal::handle_eis_event(struct eis_event* event) {
                                                       modifier_state_locked, 
                                                       modifier_state_group);
                                                       
-                std::cout << "✅ Key " << keycode << " (" << (is_press ? "pressed" : "released") 
-                         << ") forwarded with modifier state: " << modifier_state_depressed << std::endl;
-            } else {
-                std::cout << "❌ Cannot forward key - missing virtual keyboard!" << std::endl;
             }
             break;
         }
         
         case EIS_EVENT_FRAME:
-            // Frame events group related events together - just log for now
-            std::cout << "📸 EIS: Frame event" << std::endl;
+            // Frame events group related events together; nothing to do
             break;
             
         default:
@@ -1211,35 +1152,30 @@ void Portal::update_modifier_state(uint32_t keycode, bool is_press) {
         case 54:  // Shift_R (raw keycode 54)
             is_modifier = true;
             modifier_mask = MOD_SHIFT;
-            std::cout << "🔧 Detected SHIFT key: " << keycode << std::endl;
             break;
             
         case 29:  // Control_L (raw keycode 29)
         case 97:  // Control_R (raw keycode 97)
             is_modifier = true;
             modifier_mask = MOD_CTRL;
-            std::cout << "🔧 Detected CTRL key: " << keycode << std::endl;
             break;
             
         case 56:  // Alt_L (raw keycode 56)
         case 100: // Alt_R (raw keycode 100)
             is_modifier = true;
             modifier_mask = MOD_ALT;
-            std::cout << "🔧 Detected ALT key: " << keycode << std::endl;
             break;
             
         case 125: // Super_L (raw keycode 125) - Meta/Windows key
         case 126: // Super_R (raw keycode 126)
             is_modifier = true;
             modifier_mask = MOD_META;
-            std::cout << "🔧 Detected META/SUPER key: " << keycode << std::endl;
             break;
             
         case 58:  // Caps_Lock (raw keycode 58)
             // Caps lock is special - toggle on press only
             if (is_press) {
                 modifier_state_locked ^= MOD_CAPS; // Toggle caps lock state
-                std::cout << "🔒 Caps Lock toggled: " << (modifier_state_locked & MOD_CAPS ? "ON" : "OFF") << std::endl;
             }
             return;
             
@@ -1247,7 +1183,6 @@ void Portal::update_modifier_state(uint32_t keycode, bool is_press) {
             // Num lock is special - toggle on press only
             if (is_press) {
                 modifier_state_locked ^= MOD_NUM; // Toggle num lock state
-                std::cout << "🔢 Num Lock toggled: " << (modifier_state_locked & MOD_NUM ? "ON" : "OFF") << std::endl;
             }
             return;
     }
@@ -1255,13 +1190,9 @@ void Portal::update_modifier_state(uint32_t keycode, bool is_press) {
     if (is_modifier) {
         if (is_press) {
             modifier_state_depressed |= modifier_mask;
-            std::cout << "🔧 Modifier pressed: " << modifier_mask << " (state: " << modifier_state_depressed << ")" << std::endl;
         } else {
             modifier_state_depressed &= ~modifier_mask;
-            std::cout << "🔧 Modifier released: " << modifier_mask << " (state: " << modifier_state_depressed << ")" << std::endl;
         }
-    } else {
-        std::cout << "🔍 Non-modifier key: " << keycode << std::endl;
     }
 }
 

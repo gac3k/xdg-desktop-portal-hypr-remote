@@ -127,7 +127,6 @@ void WaylandVirtualPointer::send_axis_source(uint32_t axis_source) {
 }
 
 void WaylandVirtualPointer::send_axis_discrete(uint32_t time, int32_t dx, int32_t dy) {
-    std::cout << "send_axis_discrete: dx=" << dx << " dy=" << dy << std::endl;
     if (virtual_pointer) {
         if(dy < 0) {
             zwlr_virtual_pointer_v1_axis_discrete(virtual_pointer, time, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(-15), -1);
