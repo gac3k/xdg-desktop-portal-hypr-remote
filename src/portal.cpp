@@ -565,11 +565,11 @@ void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
         
         // Send scroll events for both axes if non-zero
         if (dx != 0.0) {
-            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx, dy);
+            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx);
             libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
         }
         if (dy != 0.0) {
-            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dx, dy);
+            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy);
             libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_VERTICAL_SCROLL);
         }
         libei_handler->pointer->send_frame();
@@ -1000,12 +1000,12 @@ void Portal::handle_eis_event(struct eis_event* event) {
                 double scale_factor = 15.0; // Good default for smooth scrolling
                 
                 if (dx != 0.0) {
-                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx * scale_factor, dy);
+                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx * scale_factor);
                     // Send axis stop to complete the scroll event
                     libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
                 }
                 if (dy != 0.0) {
-                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dx * scale_factor, dy);
+                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy * scale_factor);
                     // Send axis stop to complete the scroll event  
                     libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_VERTICAL_SCROLL);
                 }

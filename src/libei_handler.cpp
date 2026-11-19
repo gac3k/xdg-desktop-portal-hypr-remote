@@ -251,10 +251,10 @@ void LibEIHandler::handle_pointer_event(struct ei_event* event) {
             
             // Send scroll events for both axes if non-zero
             if (dx != 0.0) {
-                pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx, dy);
+                pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx);
             }
             if (dy != 0.0) {
-                pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy, dx);
+                pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy);
             }
             pointer->send_frame();
             break;

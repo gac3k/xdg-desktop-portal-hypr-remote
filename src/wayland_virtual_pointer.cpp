@@ -114,9 +114,9 @@ void WaylandVirtualPointer::send_button(uint32_t time, uint32_t button, uint32_t
     }
 }
 
-void WaylandVirtualPointer::send_axis(uint32_t time, uint32_t axis, double dx, double dy) {
+void WaylandVirtualPointer::send_axis(uint32_t time, uint32_t axis, double value) {
     if (virtual_pointer) {
-        zwlr_virtual_pointer_v1_axis(virtual_pointer, time, axis, wl_fixed_from_double(dx));
+        zwlr_virtual_pointer_v1_axis(virtual_pointer, time, axis, wl_fixed_from_double(value));
     }
 }
 
