@@ -1,3 +1,4 @@
+#include <atomic>
 #include "portal.h"
 #include "libei_handler.h"
 #include "wayland_virtual_keyboard.h"
@@ -43,10 +44,10 @@ bool Portal::init(LibEIHandler* handler) {
         connection = sdbus::createSessionBusConnection();
         
         // Request the portal name
-        connection->requestName(PORTAL_NAME);
+        connection->requestName(sdbus::ServiceName{PORTAL_NAME});
         
         // Create the portal object
-        object = sdbus::createObject(*connection, PORTAL_PATH);
+        object = sdbus::createObject(*connection, sdbus::ObjectPath{PORTAL_PATH});
         std::cout << "Portal D-Bus interface registered at " << PORTAL_NAME << std::endl;
         std::cout << "Portal registered on SESSION bus (not system bus)" << std::endl;
         std::cout << "Portal version: 2" << std::endl;
@@ -54,37 +55,38 @@ bool Portal::init(LibEIHandler* handler) {
         std::cout << "Portal interface: " << PORTAL_INTERFACE << std::endl;
 
         // Register RemoteDesktop interface methods with correct signatures
-        object->registerMethod(PORTAL_INTERFACE, "CreateSession", "oosa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { CreateSession(std::move(call)); });
         
-        /* object->registerMethod(PORTAL_INTERFACE, "SelectSources", "oosa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { SelectSources(std::move(call)); }); */
         
-        object->registerMethod(PORTAL_INTERFACE, "SelectDevices", "oosa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { SelectDevices(std::move(call)); });
+        /*  */
         
-        object->registerMethod(PORTAL_INTERFACE, "Start", "oossa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { Start(std::move(call)); });
+        
+        
+        
         
         // Add the input notification methods that clients call to send input events
-        object->registerMethod(PORTAL_INTERFACE, "NotifyPointerMotion", "oa{sv}dd", "", 
-                              [this](sdbus::MethodCall call) { NotifyPointerMotion(std::move(call)); });
         
-        object->registerMethod(PORTAL_INTERFACE, "NotifyPointerButton", "oa{sv}iu", "", 
-                              [this](sdbus::MethodCall call) { NotifyPointerButton(std::move(call)); });
         
-        object->registerMethod(PORTAL_INTERFACE, "NotifyKeyboardKeycode", "oa{sv}iu", "", 
-                              [this](sdbus::MethodCall call) { NotifyKeyboardKeycode(std::move(call)); });
         
-        object->registerMethod(PORTAL_INTERFACE, "NotifyPointerAxis", "oa{sv}dd", "", 
-                              [this](sdbus::MethodCall call) { NotifyPointerAxis(std::move(call)); });
+        
+        
+        
+        
         
         // Modern EIS (Emulated Input Server) method - this is what deskflow actually uses!
-        object->registerMethod(PORTAL_INTERFACE, "ConnectToEIS", "osa{sv}", "h", 
-                              [this](sdbus::MethodCall call) { ConnectToEIS(std::move(call)); });
-        object->registerProperty(PORTAL_INTERFACE, "version", "u", [](sdbus::PropertyGetReply& reply) -> void { reply << (uint)2; });
+        
+        
         // Finalize the object
-        object->finishRegistration();
+        object->addVTable(
+            sdbus::MethodVTableItem{sdbus::MethodName{"CreateSession"}, sdbus::Signature{"oosa{sv}"}, {}, sdbus::Signature{"ua{sv}"}, {}, [this](sdbus::MethodCall call) { CreateSession(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SelectDevices"}, sdbus::Signature{"oosa{sv}"}, {}, sdbus::Signature{"ua{sv}"}, {}, [this](sdbus::MethodCall call) { SelectDevices(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"Start"}, sdbus::Signature{"oossa{sv}"}, {}, sdbus::Signature{"ua{sv}"}, {}, [this](sdbus::MethodCall call) { Start(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"NotifyPointerMotion"}, sdbus::Signature{"oa{sv}dd"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { NotifyPointerMotion(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"NotifyPointerButton"}, sdbus::Signature{"oa{sv}iu"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { NotifyPointerButton(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"NotifyKeyboardKeycode"}, sdbus::Signature{"oa{sv}iu"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { NotifyKeyboardKeycode(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"NotifyPointerAxis"}, sdbus::Signature{"oa{sv}dd"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { NotifyPointerAxis(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"ConnectToEIS"}, sdbus::Signature{"osa{sv}"}, {}, sdbus::Signature{"h"}, {}, [this](sdbus::MethodCall call) { ConnectToEIS(std::move(call)); }, {}},
+            sdbus::PropertyVTableItem{sdbus::PropertyName{"version"}, sdbus::Signature{"u"}, [](sdbus::PropertyGetReply& reply) { reply << (uint32_t)2; }, {}, {}}
+        ).forInterface(sdbus::InterfaceName{PORTAL_INTERFACE});
         
         std::cout << "Portal D-Bus interface registered at " << PORTAL_NAME << std::endl;
         std::cout << "Portal registered on SESSION bus (not system bus)" << std::endl;
@@ -453,13 +455,13 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
         }
     } catch (const std::exception& e) {
         std::cerr << "Error extracting ConnectToEIS parameters: " << e.what() << std::endl;
-        call.createErrorReply(sdbus::Error("org.freedesktop.portal.Error.Failed", "Failed to extract parameters")).send();
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to extract parameters")).send();
         return;
     }
     
     if (!libei_handler || !libei_handler->keyboard || !libei_handler->pointer) {
         std::cerr << "Virtual devices not available" << std::endl;
-        call.createErrorReply(sdbus::Error("org.freedesktop.portal.Error.Failed", "Virtual devices not available")).send();
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Virtual devices not available")).send();
         return;
     }
     
@@ -467,7 +469,7 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
     int socket_pair[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, socket_pair) == -1) {
         std::cerr << "Error creating socket pair: " << strerror(errno) << std::endl;
-        call.createErrorReply(sdbus::Error("org.freedesktop.portal.Error.Failed", "Failed to create socket pair")).send();
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to create socket pair")).send();
         return;
     }
     
@@ -498,7 +500,8 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
         
         // Alternative approach: Create a proper EIS server socket and handle the connection
         char socket_path[256];
-        snprintf(socket_path, sizeof(socket_path), "/tmp/hypr-portal-eis-%d", getpid());
+        static std::atomic<unsigned> eis_session_counter{0};
+        snprintf(socket_path, sizeof(socket_path), "/tmp/hypr-portal-eis-%d-%u", getpid(), eis_session_counter++);
         
         // Setup EIS backend with temporary socket
         int rc = eis_setup_backend_socket(eis_context, socket_path);
@@ -636,8 +639,10 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
                 //std::cout << "🎯 EIS: Processing event " << event_count << " type=" << eis_event_get_type(event) << std::endl;
                 
                 // Handle EIS events and forward to virtual devices
+                bool client_gone = eis_event_get_type(event) == EIS_EVENT_CLIENT_DISCONNECT;
                 handle_eis_event(event);
                 eis_event_unref(event);
+                if (client_gone) stop = true;
             }
             
             if (event_count > 0) {
