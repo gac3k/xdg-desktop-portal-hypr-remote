@@ -1,5 +1,6 @@
 #include <atomic>
 #include "portal.h"
+#include "clipboard.h"
 #include "libei_handler.h"
 #include "wayland_virtual_keyboard.h"
 #include "wayland_virtual_pointer.h"
@@ -175,6 +176,13 @@ void track_absolute(const Layout& layout, double& x, double& y) {
 
 static const char* PORTAL_INTERFACE = "org.freedesktop.impl.portal.RemoteDesktop";
 static const char* PORTAL_PATH = "/org/freedesktop/portal/desktop";
+static const char* CLIPBOARD_INTERFACE = "org.freedesktop.impl.portal.Clipboard";
+static const char* SESSION_INTERFACE = "org.freedesktop.impl.portal.Session";
+static const char* PORTAL_ERROR_FAILED = "org.freedesktop.portal.Error.Failed";
+
+static void reply_failed(sdbus::MethodCall& call, const std::string& message) {
+    call.createErrorReply(sdbus::Error(sdbus::Error::Name{PORTAL_ERROR_FAILED}, message)).send();
+}
 
 // Use development name if requested, otherwise use standard name
 static const char* PORTAL_NAME = "org.freedesktop.impl.portal.desktop.hypr-remote";
@@ -186,8 +194,9 @@ Portal::~Portal() {
     cleanup();
 }
 
-bool Portal::init(LibEIHandler* handler) {
+bool Portal::init(LibEIHandler* handler, WaylandClipboard* clip) {
     libei_handler = handler;
+    clipboard = clip;
     
     try {
         // Create D-Bus connection to SESSION bus (not system bus)
@@ -237,21 +246,50 @@ bool Portal::init(LibEIHandler* handler) {
             sdbus::MethodVTableItem{sdbus::MethodName{"ConnectToEIS"}, sdbus::Signature{"osa{sv}"}, {}, sdbus::Signature{"h"}, {}, [this](sdbus::MethodCall call) { ConnectToEIS(std::move(call)); }, {}},
             sdbus::PropertyVTableItem{sdbus::PropertyName{"version"}, sdbus::Signature{"u"}, [](sdbus::PropertyGetReply& reply) { reply << (uint32_t)2; }, {}, {}}
         ).forInterface(sdbus::InterfaceName{PORTAL_INTERFACE});
+
+        // Clipboard interface (always exported; methods fail if data-control is missing)
+        object->addVTable(
+            sdbus::MethodVTableItem{sdbus::MethodName{"RequestClipboard"}, sdbus::Signature{"oa{sv}"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { RequestClipboard(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SetSelection"}, sdbus::Signature{"oa{sv}"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { SetSelection(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SelectionWrite"}, sdbus::Signature{"ou"}, {}, sdbus::Signature{"h"}, {}, [this](sdbus::MethodCall call) { SelectionWrite(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SelectionWriteDone"}, sdbus::Signature{"oub"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { SelectionWriteDone(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SelectionRead"}, sdbus::Signature{"os"}, {}, sdbus::Signature{"h"}, {}, [this](sdbus::MethodCall call) { SelectionRead(std::move(call)); }, {}},
+            sdbus::SignalVTableItem{sdbus::SignalName{"SelectionOwnerChanged"}, sdbus::Signature{"oa{sv}"}, {}, {}},
+            sdbus::SignalVTableItem{sdbus::SignalName{"SelectionTransfer"}, sdbus::Signature{"osu"}, {}, {}},
+            sdbus::PropertyVTableItem{sdbus::PropertyName{"version"}, sdbus::Signature{"u"}, [](sdbus::PropertyGetReply& reply) { reply << (uint32_t)1; }, {}, {}}
+        ).forInterface(sdbus::InterfaceName{CLIPBOARD_INTERFACE});
         
         std::cout << "Portal D-Bus interface registered at " << PORTAL_NAME << std::endl;
         std::cout << "Portal registered on SESSION bus (not system bus)" << std::endl;
-        return true;
-        
     } catch (const sdbus::Error& e) {
         std::cerr << "Failed to initialize D-Bus portal: " << e.what() << std::endl;
         std::cerr << "This is normal if another portal is already running or if running outside a desktop session." << std::endl;
         cleanup();
         return false;
     }
+
+    // Clipboard failures never stop mouse and keyboard (clipboard.h, items 8-9).
+    if (clipboard) {
+        ClipboardCallbacks callbacks;
+        callbacks.owner_changed = [this](const std::vector<std::string>& mimes) { emit_owner_changed(mimes); };
+        callbacks.transfer_requested = [this](const std::string& mime, uint32_t serial) { return emit_transfer(mime, serial); };
+        if (!clipboard->init(std::move(callbacks)))
+            std::cerr << "clipboard: disabled; remote input still works" << std::endl;
+    }
+    return true;
 }
 
 void Portal::cleanup() {
     running = false;
+
+    // Session objects must go before the connection. The clipboard thread has
+    // been stopped by now (main stops it before cleanup()).
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        sessions.clear();
+        retired.clear();
+        clip_session.clear();
+    }
     
     if (object) {
         object.reset();
@@ -319,6 +357,8 @@ void Portal::CreateSession(sdbus::MethodCall call) {
         return;
     }
     
+    export_session(session_handle);
+
     // Create session response
     std::map<std::string, sdbus::Variant> response;
     response["session_handle"] = sdbus::Variant(session_handle);
@@ -447,11 +487,29 @@ void Portal::Start(sdbus::MethodCall call) {
     // Start the remote desktop session
     std::map<std::string, sdbus::Variant> response;
     response["devices"] = sdbus::Variant(static_cast<uint32_t>(7)); // keyboard | pointer | touchscreen
+
+    bool clipboard_enabled = false;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        auto& state = sessions[session_handle];
+        state.started = true;
+        clipboard_enabled = state.clipboard_requested && clipboard && clipboard->available();
+    }
+    if (clipboard_enabled) response["clipboard_enabled"] = sdbus::Variant(true);
+    std::cout << "Start: clipboard_enabled=" << (clipboard_enabled ? "true" : "false") << std::endl;
     
     auto reply = call.createReply();
     reply << static_cast<uint32_t>(0); // Success
     reply << response;
     reply.send();
+
+    if (clipboard_enabled) {
+        {
+            std::lock_guard<std::mutex> lock(sessions_mtx);
+            clip_session = session_handle;
+        }
+        clipboard->announce();
+    }
     
     std::cout << "Start completed - remote desktop session active for session: " << session_handle << std::endl;
     std::cout << "LibEI handler ready for input processing" << std::endl;
@@ -1198,4 +1256,217 @@ void Portal::update_modifier_state(uint32_t keycode, bool is_press) {
     } else {
         std::cout << "🔍 Non-modifier key: " << keycode << std::endl;
     }
-} 
+}
+
+// ---- org.freedesktop.impl.portal.Session ------------------------------------
+
+void Portal::export_session(const sdbus::ObjectPath& session_handle) {
+    const std::string handle = session_handle;
+    // Objects are created and destroyed outside sessions_mtx.
+    std::unique_ptr<sdbus::IObject> old;
+    std::vector<std::unique_ptr<sdbus::IObject>> closed;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        closed.swap(retired);
+        auto it = sessions.find(handle);
+        if (it != sessions.end()) old = std::move(it->second.obj);
+    }
+    old.reset();
+    closed.clear();
+
+    try {
+        auto obj = sdbus::createObject(*connection, session_handle);
+        obj->addVTable(
+            sdbus::MethodVTableItem{sdbus::MethodName{"Close"}, sdbus::Signature{""}, {}, sdbus::Signature{""}, {}, [this, handle](sdbus::MethodCall call) { SessionClose(std::move(call), handle); }, {}},
+            sdbus::SignalVTableItem{sdbus::SignalName{"Closed"}, sdbus::Signature{""}, {}, {}},
+            sdbus::PropertyVTableItem{sdbus::PropertyName{"version"}, sdbus::Signature{"u"}, [](sdbus::PropertyGetReply& reply) { reply << (uint32_t)1; }, {}, {}}
+        ).forInterface(sdbus::InterfaceName{SESSION_INTERFACE});
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        sessions[handle].obj = std::move(obj);
+    } catch (const sdbus::Error& e) {
+        std::cerr << "Failed to export Session object at " << handle << ": " << e.what() << std::endl;
+    }
+}
+
+void Portal::SessionClose(sdbus::MethodCall call, const std::string& session_handle) {
+    call.createReply().send();
+
+    bool was_clipboard_session = false;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        auto it = sessions.find(session_handle);
+        if (it != sessions.end()) {
+            // Can't destroy an object inside its own callback: retire it.
+            if (it->second.obj) retired.push_back(std::move(it->second.obj));
+            sessions.erase(it);
+        }
+        if (clip_session == session_handle) {
+            clip_session.clear();
+            was_clipboard_session = true;
+        }
+    }
+    std::cout << "Session closed: " << session_handle << std::endl;
+    if (was_clipboard_session && clipboard) clipboard->session_ended();
+}
+
+// ---- org.freedesktop.impl.portal.Clipboard ----------------------------------
+
+bool Portal::is_clip_session(const std::string& session_handle) {
+    if (!clipboard || !clipboard->available()) return false;
+    std::lock_guard<std::mutex> lock(sessions_mtx);
+    return !clip_session.empty() && clip_session == session_handle;
+}
+
+void Portal::RequestClipboard(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    std::map<std::string, sdbus::Variant> options;
+    try {
+        call >> session_handle >> options;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        sessions[session_handle].clipboard_requested = true;
+    }
+    std::cout << "clipboard requested for session " << session_handle << std::endl;
+    call.createReply().send();
+}
+
+void Portal::SetSelection(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    std::map<std::string, sdbus::Variant> options;
+    try {
+        call >> session_handle >> options;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    if (!is_clip_session(session_handle)) {
+        reply_failed(call, "Clipboard not enabled for this session");
+        return;
+    }
+    std::vector<std::string> mimes;
+    auto it = options.find("mime_types");
+    if (it != options.end()) {
+        try {
+            mimes = it->second.get<std::vector<std::string>>();
+        } catch (const sdbus::Error&) {
+            reply_failed(call, "mime_types must be of type as");
+            return;
+        }
+    }
+    mimes.erase(std::remove(mimes.begin(), mimes.end(), std::string(kOwnedMarker)), mimes.end());
+    std::cout << "clipboard: SetSelection with " << mimes.size() << " type(s)" << std::endl;
+    if (!mimes.empty()) clipboard->claim(std::move(mimes));
+    call.createReply().send();
+}
+
+void Portal::SelectionWrite(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    uint32_t serial = 0;
+    try {
+        call >> session_handle >> serial;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    if (!is_clip_session(session_handle)) {
+        reply_failed(call, "Clipboard not enabled for this session");
+        return;
+    }
+    int fd = clipboard->take_write_fd(serial);
+    if (fd < 0) {
+        reply_failed(call, "Unknown or expired serial");
+        return;
+    }
+    // adopt_fd: the UnixFd owns our copy and closes it after the reply (Types.h:329).
+    sdbus::UnixFd unix_fd{fd, sdbus::adopt_fd};
+    auto reply = call.createReply();
+    reply << unix_fd;
+    reply.send();
+}
+
+void Portal::SelectionWriteDone(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    uint32_t serial = 0;
+    bool success = false;
+    try {
+        call >> session_handle >> serial >> success;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    if (!is_clip_session(session_handle)) {
+        reply_failed(call, "Clipboard not enabled for this session");
+        return;
+    }
+    clipboard->write_done(serial, success);
+    call.createReply().send();
+}
+
+void Portal::SelectionRead(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    std::string mime_type;
+    try {
+        call >> session_handle >> mime_type;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    if (!is_clip_session(session_handle)) {
+        reply_failed(call, "Clipboard not enabled for this session");
+        return;
+    }
+    int fd = clipboard->open_read(mime_type);
+    if (fd < 0) {
+        reply_failed(call, "MIME type not offered by the current selection");
+        return;
+    }
+    sdbus::UnixFd unix_fd{fd, sdbus::adopt_fd};
+    auto reply = call.createReply();
+    reply << unix_fd;
+    reply.send();
+}
+
+// Called on the Wayland thread with no WaylandClipboard lock held. Emitting is
+// thread-safe (IObject.h:57-59); we never emit while holding sessions_mtx.
+void Portal::emit_owner_changed(const std::vector<std::string>& mimes) {
+    std::string session;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        session = clip_session;
+    }
+    if (session.empty() || !object) return;
+    try {
+        std::map<std::string, sdbus::Variant> options;
+        options["mime_types"] = sdbus::Variant(mimes);
+        options["session_is_owner"] = sdbus::Variant(false);
+        auto signal = object->createSignal(sdbus::InterfaceName{CLIPBOARD_INTERFACE},
+                                           sdbus::SignalName{"SelectionOwnerChanged"});
+        signal << sdbus::ObjectPath{session} << options;
+        object->emitSignal(signal);
+    } catch (const sdbus::Error& e) {
+        std::cerr << "clipboard: SelectionOwnerChanged failed: " << e.what() << std::endl;
+    }
+}
+
+bool Portal::emit_transfer(const std::string& mime, uint32_t serial) {
+    std::string session;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        session = clip_session;
+    }
+    if (session.empty() || !object) return false;
+    try {
+        auto signal = object->createSignal(sdbus::InterfaceName{CLIPBOARD_INTERFACE},
+                                           sdbus::SignalName{"SelectionTransfer"});
+        signal << sdbus::ObjectPath{session} << mime << serial;
+        object->emitSignal(signal);
+        return true;
+    } catch (const sdbus::Error& e) {
+        std::cerr << "clipboard: SelectionTransfer failed: " << e.what() << std::endl;
+        return false;
+    }
+}

@@ -2,6 +2,7 @@
 #include "wayland_virtual_keyboard.h"
 #include "wayland_virtual_pointer.h"
 #include "libei_handler.h"
+#include "clipboard.h"
 #include <iostream>
 #include <thread>
 #include <signal.h>
@@ -18,6 +19,9 @@ int main(int argc, char* argv[]) {
     // Set up signal handling
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    // Writes to a socket or pipe whose reader has gone must fail with EPIPE,
+    // not kill the portal (EIS bridge, clipboard fds).
+    signal(SIGPIPE, SIG_IGN);
     
     std::cout << "Hyprland Remote Desktop Portal starting..." << std::endl;
     
@@ -26,6 +30,8 @@ int main(int argc, char* argv[]) {
     WaylandVirtualPointer waylandVP;
     LibEIHandler libeiHandler;
     Portal portal;
+    // Declared after portal so that it is destroyed (and its thread stopped) first.
+    WaylandClipboard clipboard;
     
     // Initialize Wayland virtual keyboard
     if (!waylandVK.init()) {
@@ -59,7 +65,8 @@ int main(int argc, char* argv[]) {
     std::cout << "✓ LibEI handler started and ready for connections" << std::endl;
     
     // Initialize portal
-    if (!portal.init(&libeiHandler)) {
+    // Initialize portal; it also initializes the clipboard (clipboard.h, item 9)
+    if (!portal.init(&libeiHandler, &clipboard)) {
         std::cerr << "Failed to initialize D-Bus portal" << std::endl;
         libeiHandler.cleanup();
         waylandVP.cleanup();
@@ -89,6 +96,10 @@ int main(int argc, char* argv[]) {
     if (portal_thread.joinable()) {
         portal_thread.join();
     }
+    
+    // The clipboard thread emits signals on portal's object, so stop it before
+    // portal.cleanup() destroys that object.
+    clipboard.stop();
     
     libeiHandler.stop();
     if (libei_thread.joinable()) {
