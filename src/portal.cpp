@@ -890,6 +890,7 @@ void Portal::handle_eis_event(struct eis_event* event) {
         case EIS_EVENT_POINTER_MOTION_ABSOLUTE: {
             double x = eis_event_pointer_get_absolute_x(event);
             double y = eis_event_pointer_get_absolute_y(event);
+            if (!std::isfinite(x) || !std::isfinite(y)) break;
             
             
             // Forward to virtual pointer  
