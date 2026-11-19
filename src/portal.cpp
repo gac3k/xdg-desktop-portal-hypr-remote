@@ -628,6 +628,30 @@ void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
     reply.send();
 }
 
+// Drop one of our EIS devices (libei 1.6.0, checked against the source):
+// eis_device_remove takes the device off seat->devices and drops libeis's own ref.
+// It is a no-op on a device that eis_seat_drop already removed (state DEAD), and
+// it must run before the seat goes, or eis_seat_destroy asserts "device list not
+// empty". Our unref then frees the device and, with it, its region and keymap
+// (the keymap's memfd dup).
+static void release_eis_device(struct eis_device*& device) {
+    if (!device) return;
+    eis_device_remove(device);
+    eis_device_unref(device);
+    device = nullptr;
+}
+
+// Release everything in `conn`, devices first and the seat last. Safe to call
+// more than once. Callers hold input_mutex, as handle_eis_event does.
+static void release_eis_conn(EisConn& conn) {
+    release_eis_device(conn.pointer);
+    release_eis_device(conn.keyboard);
+    if (conn.seat) {
+        eis_seat_unref(conn.seat);
+        conn.seat = nullptr;
+    }
+}
+
 void Portal::ConnectToEIS(sdbus::MethodCall call) {
     std::cout << "🔥 RemoteDesktop ConnectToEIS called!" << std::endl;
     std::cout << "📋 FLOW: Step 5/5 - Connect to EIS (Modern approach!)" << std::endl;
@@ -716,6 +740,7 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
 
             std::cout << "🚀 Starting EIS server event loop..." << std::endl;
 
+            EisConn conn;   // our seat and device refs for this client
             bool stop = false;
             // libeis reports nothing if the fd is closed before the client ever
             // connects, so give up on our own after a while.
@@ -753,10 +778,18 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
                     enum eis_event_type type = eis_event_get_type(event);
                     if (type == EIS_EVENT_CLIENT_CONNECT) connected = true;
                     bool client_gone = type == EIS_EVENT_CLIENT_DISCONNECT;
-                    handle_eis_event(event);
+                    handle_eis_event(event, conn);
                     eis_event_unref(event);
                     if (client_gone) stop = true;
                 }
+            }
+
+            // Whatever ended the loop (disconnect, shutdown, connect deadline, poll
+            // error), drop our refs while the client still exists, then the context.
+            {
+                std::unique_lock<std::mutex> input_lock;
+                if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
+                release_eis_conn(conn);
             }
 
             std::cout << "📡 EIS server thread stopped" << std::endl;
@@ -788,7 +821,7 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
     std::cout << "✅ ConnectToEIS completed - EIS client fd sent to deskflow" << std::endl;
 }
 
-void Portal::handle_eis_event(struct eis_event* event) {
+void Portal::handle_eis_event(struct eis_event* event, EisConn& conn) {
     std::unique_lock<std::mutex> input_lock;
     if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     enum eis_event_type type = eis_event_get_type(event);
@@ -816,87 +849,162 @@ void Portal::handle_eis_event(struct eis_event* event) {
         case EIS_EVENT_CLIENT_CONNECT: {
             struct eis_client* client = eis_event_get_client(event);
             std::cout << "🔌 EIS: Client connected: " << eis_client_get_name(client) << std::endl;
-            
+
+            // The fd backend context has one client; refuse anything else.
+            if (conn.client) {
+                std::cerr << "EIS: unexpected second client; disconnecting it" << std::endl;
+                eis_client_disconnect(client);
+                break;
+            }
+            conn.client = client;
+
             // Accept the client connection
             eis_client_connect(client);
-            
-            // Add a seat for this client (required for devices)
-            struct eis_seat* seat = eis_client_new_seat(client, "hyprland-portal-seat");
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_POINTER);
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_POINTER_ABSOLUTE);
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_KEYBOARD);
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_BUTTON);
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_SCROLL);
-            eis_seat_add(seat);
-            
+
+            // Add a seat for this client (required for devices). We keep the ref
+            // eis_client_new_seat returns until release_eis_conn().
+            conn.seat = eis_client_new_seat(client, "hyprland-portal-seat");
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_POINTER);
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_POINTER_ABSOLUTE);
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_KEYBOARD);
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_BUTTON);
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_SCROLL);
+            eis_seat_add(conn.seat);
+
             std::cout << "💺 EIS: Seat added for client with capabilities" << std::endl;
             break;
         }
-        
+
         case EIS_EVENT_CLIENT_DISCONNECT:
             std::cout << "🔌 EIS: Client disconnected" << std::endl;
+            // libeis has already dropped the seat (its devices are removed); the
+            // event still holds the client, so release our refs now.
+            if (eis_event_get_client(event) == conn.client) release_eis_conn(conn);
             break;
-            
+
         case EIS_EVENT_SEAT_BIND: {
             struct eis_seat* seat = eis_event_get_seat(event);
-            std::cout << "💺 EIS: Seat bound by client" << std::endl;
-            
-            // Add pointer device
-            struct eis_device* pointer = eis_seat_new_device(seat);
-            eis_device_configure_name(pointer, "Hyprland Portal Pointer");
-            eis_device_configure_capability(pointer, EIS_DEVICE_CAP_POINTER);
-            eis_device_configure_capability(pointer, EIS_DEVICE_CAP_POINTER_ABSOLUTE);
-            eis_device_configure_capability(pointer, EIS_DEVICE_CAP_BUTTON);
-            eis_device_configure_capability(pointer, EIS_DEVICE_CAP_SCROLL);
-            
-            // Set pointer region (screen size)
-            struct eis_region* region = eis_device_new_region(pointer);
+            if (!conn.seat || seat != conn.seat) break;
+
+            const bool want_pointer =
+                eis_event_seat_has_capability(event, EIS_DEVICE_CAP_POINTER) ||
+                eis_event_seat_has_capability(event, EIS_DEVICE_CAP_POINTER_ABSOLUTE) ||
+                eis_event_seat_has_capability(event, EIS_DEVICE_CAP_BUTTON) ||
+                eis_event_seat_has_capability(event, EIS_DEVICE_CAP_SCROLL);
+            const bool want_keyboard = eis_event_seat_has_capability(event, EIS_DEVICE_CAP_KEYBOARD);
+
+            if (!want_pointer && !want_keyboard) {
+                // Unbind. libeis sends this (caps 0) when it drops the seat on
+                // disconnect; the seat is gone, so create nothing on it.
+                release_eis_device(conn.pointer);
+                release_eis_device(conn.keyboard);
+                std::cout << "💺 EIS: seat unbound; devices removed" << std::endl;
+                break;
+            }
+
+            // A client that binds and leaves at once has its seat dropped (and a
+            // newer SEAT_BIND or the disconnect queued) before we see this bind.
+            // Devices made now would sit on a dead seat, so let that event decide.
             {
-                Layout layout = current_layout(true);
-                eis_region_set_size(region, static_cast<uint32_t>(layout.width), static_cast<uint32_t>(layout.height));
-                std::cout << "EIS: Pointer region " << layout.width << "x" << layout.height
-                          << " across " << layout.monitors.size() << " monitor(s)" << std::endl;
-            }
-            eis_region_add(region);
-            
-            eis_device_add(pointer);
-            eis_device_resume(pointer);
-            
-            // Add keyboard device with proper keymap setup
-            struct eis_device* keyboard = eis_seat_new_device(seat);
-            eis_device_configure_name(keyboard, "Hyprland Portal Keyboard");
-            eis_device_configure_capability(keyboard, EIS_DEVICE_CAP_KEYBOARD);
-            
-            // Set up a basic keymap for proper modifier key handling
-            // This is crucial for key combinations like Meta+Enter to work
-            const char* keymap_str = 
-                "xkb_keymap {\n"
-                "xkb_keycodes  { include \"evdev+aliases(qwerty)\" };\n"
-                "xkb_types     { include \"complete\" };\n"
-                "xkb_compat    { include \"complete\" };\n"
-                "xkb_symbols   { include \"pc+us+inet(evdev)\" };\n"
-                "xkb_geometry  { include \"pc(pc105)\" };\n"
-                "};\n";
-                
-            // Create a memory file for the keymap
-            size_t keymap_size = strlen(keymap_str);
-            int memfd = memfd_create("keymap", MFD_CLOEXEC);
-            if (memfd >= 0) {
-                if (write(memfd, keymap_str, keymap_size) == (ssize_t)keymap_size) {
-                    struct eis_keymap* keymap = eis_device_new_keymap(keyboard, 
-                        EIS_KEYMAP_TYPE_XKB, memfd, keymap_size);
-                    if (keymap) {
-                        eis_keymap_add(keymap);
-                        std::cout << "🗝️ EIS: Keymap configured for proper modifier handling" << std::endl;
-                    }
+                struct eis_event* next = eis_peek_event(eis_client_get_context(eis_event_get_client(event)));
+                bool superseded = false;
+                if (next) {
+                    enum eis_event_type next_type = eis_event_get_type(next);
+                    superseded = next_type == EIS_EVENT_CLIENT_DISCONNECT ||
+                                 (next_type == EIS_EVENT_SEAT_BIND && eis_event_get_seat(next) == seat);
+                    eis_event_unref(next);
                 }
-                close(memfd);
+                if (superseded) {
+                    std::cout << "💺 EIS: seat bind superseded by a queued event; skipped" << std::endl;
+                    break;
+                }
             }
-            
-            eis_device_add(keyboard);
-            eis_device_resume(keyboard);
-            
-            std::cout << "🖱️ EIS: Pointer and keyboard devices added with enhanced features" << std::endl;
+
+            {
+                std::string caps;
+                auto add = [&](enum eis_device_capability c, const char* name) {
+                    if (!eis_event_seat_has_capability(event, c)) return;
+                    if (!caps.empty()) caps += ',';
+                    caps += name;
+                };
+                add(EIS_DEVICE_CAP_POINTER, "pointer");
+                add(EIS_DEVICE_CAP_POINTER_ABSOLUTE, "pointer-absolute");
+                add(EIS_DEVICE_CAP_BUTTON, "button");
+                add(EIS_DEVICE_CAP_SCROLL, "scroll");
+                add(EIS_DEVICE_CAP_KEYBOARD, "keyboard");
+                std::cout << "💺 EIS: seat bind caps=" << caps << std::endl;
+            }
+
+            // A capability the client no longer binds: drop its device.
+            if (!want_pointer) release_eis_device(conn.pointer);
+            if (!want_keyboard) release_eis_device(conn.keyboard);
+
+            if (want_pointer && !conn.pointer) {
+                // We keep the ref eis_seat_new_device returns, in conn.
+                struct eis_device* pointer = eis_seat_new_device(seat);
+                conn.pointer = pointer;
+                eis_device_configure_name(pointer, "Hyprland Portal Pointer");
+                eis_device_configure_capability(pointer, EIS_DEVICE_CAP_POINTER);
+                eis_device_configure_capability(pointer, EIS_DEVICE_CAP_POINTER_ABSOLUTE);
+                eis_device_configure_capability(pointer, EIS_DEVICE_CAP_BUTTON);
+                eis_device_configure_capability(pointer, EIS_DEVICE_CAP_SCROLL);
+
+                // Set pointer region (screen size). eis_region_add gives the
+                // device its own ref, so ours goes right after.
+                struct eis_region* region = eis_device_new_region(pointer);
+                if (region) {
+                    Layout layout = current_layout(true);
+                    eis_region_set_size(region, static_cast<uint32_t>(layout.width), static_cast<uint32_t>(layout.height));
+                    std::cout << "EIS: Pointer region " << layout.width << "x" << layout.height
+                              << " across " << layout.monitors.size() << " monitor(s)" << std::endl;
+                    eis_region_add(region);
+                    eis_region_unref(region);
+                }
+
+                eis_device_add(pointer);
+                eis_device_resume(pointer);
+                std::cout << "🖱️ EIS: Pointer device added" << std::endl;
+            }
+
+            if (want_keyboard && !conn.keyboard) {
+                struct eis_device* keyboard = eis_seat_new_device(seat);
+                conn.keyboard = keyboard;
+                eis_device_configure_name(keyboard, "Hyprland Portal Keyboard");
+                eis_device_configure_capability(keyboard, EIS_DEVICE_CAP_KEYBOARD);
+
+                // Set up a basic keymap for proper modifier key handling
+                // This is crucial for key combinations like Meta+Enter to work
+                const char* keymap_str =
+                    "xkb_keymap {\n"
+                    "xkb_keycodes  { include \"evdev+aliases(qwerty)\" };\n"
+                    "xkb_types     { include \"complete\" };\n"
+                    "xkb_compat    { include \"complete\" };\n"
+                    "xkb_symbols   { include \"pc+us+inet(evdev)\" };\n"
+                    "xkb_geometry  { include \"pc(pc105)\" };\n"
+                    "};\n";
+
+                // Create a memory file for the keymap. libeis dups the fd; the
+                // dup lives as long as the keymap, which the device owns once
+                // eis_keymap_add has run, so ours goes right after.
+                size_t keymap_size = strlen(keymap_str);
+                int memfd = memfd_create("keymap", MFD_CLOEXEC);
+                if (memfd >= 0) {
+                    if (write(memfd, keymap_str, keymap_size) == (ssize_t)keymap_size) {
+                        struct eis_keymap* keymap = eis_device_new_keymap(keyboard,
+                            EIS_KEYMAP_TYPE_XKB, memfd, keymap_size);
+                        if (keymap) {
+                            eis_keymap_add(keymap);
+                            eis_keymap_unref(keymap);
+                            std::cout << "🗝️ EIS: Keymap configured for proper modifier handling" << std::endl;
+                        }
+                    }
+                    close(memfd);
+                }
+
+                eis_device_add(keyboard);
+                eis_device_resume(keyboard);
+                std::cout << "⌨️ EIS: Keyboard device added" << std::endl;
+            }
             break;
         }
         

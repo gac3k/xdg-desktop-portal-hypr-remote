@@ -16,6 +16,16 @@ extern "C" {
 class LibEIHandler;
 class WaylandClipboard;
 
+// Per-connection EIS objects. Lives on the EIS thread's stack (one context serves
+// exactly one client). Each non-null pointer is a ref we own; release_eis_conn()
+// in portal.cpp drops them, devices before the seat.
+struct EisConn {
+    struct eis_client* client = nullptr;   // not a ref; only used to spot a second client
+    struct eis_seat* seat = nullptr;
+    struct eis_device* pointer = nullptr;
+    struct eis_device* keyboard = nullptr;
+};
+
 class Portal {
 public:
     Portal();
@@ -96,5 +106,5 @@ private:
     void SessionClose(sdbus::MethodCall call, const std::string& session_handle);
 
     // EIS event handling
-    void handle_eis_event(struct eis_event* event);
+    void handle_eis_event(struct eis_event* event, EisConn& conn);
 };  
