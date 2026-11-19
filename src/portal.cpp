@@ -21,6 +21,156 @@ extern "C" {
 #include <libei.h>
 #include "libei-1.0/libeis.h"
 #include <wayland-client-protocol.h>
+
+// ---- Monitor layout (hypr-remote local patch) ----------------------------
+// Synergy/Deskflow sends absolute positions within one rectangle. Hyprland
+// maps virtual-pointer absolute motion onto the bounding box of all monitors
+// without keeping it on a monitor, so the cursor could enter the dead space
+// of a non-rectangular layout. We advertise the real bounding box and clamp
+// every absolute position onto the nearest monitor.
+#include <cstdio>
+#include <cmath>
+#include <vector>
+#include <mutex>
+
+namespace {
+struct LayoutRect { double x, y, w, h; };
+struct Layout {
+    std::vector<LayoutRect> monitors;
+    double min_x = 0, min_y = 0, width = 1920, height = 1080;
+};
+
+Layout parse_hyprctl_monitors() {
+    Layout layout;
+    FILE* pipe = popen("hyprctl monitors 2>/dev/null", "r");
+    if (!pipe) return layout;
+    std::vector<LayoutRect> rects;
+    char line[512];
+    int pw = 0, ph = 0, px = 0, py = 0, transform = 0;
+    double scale = 1.0;
+    bool have_mode = false;
+    auto flush = [&]() {
+        if (!have_mode) return;
+        double w = pw / (scale > 0 ? scale : 1.0);
+        double h = ph / (scale > 0 ? scale : 1.0);
+        if (transform % 2 == 1) std::swap(w, h);
+        rects.push_back({double(px), double(py), std::round(w), std::round(h)});
+        have_mode = false; scale = 1.0; transform = 0;
+    };
+    while (fgets(line, sizeof line, pipe)) {
+        if (strncmp(line, "Monitor ", 8) == 0) { flush(); continue; }
+        double hz; int a, b, c, d;
+        if (sscanf(line, " %dx%d@%lf at %dx%d", &a, &b, &hz, &c, &d) == 5) {
+            pw = a; ph = b; px = c; py = d; have_mode = true;
+        } else if (sscanf(line, " scale: %lf", &hz) == 1) {
+            scale = hz;
+        } else if (sscanf(line, " transform: %d", &a) == 1) {
+            transform = a;
+        }
+    }
+    flush();
+    pclose(pipe);
+    if (rects.empty()) return layout;
+    double x0 = rects[0].x, y0 = rects[0].y, x1 = x0, y1 = y0;
+    for (auto& r : rects) {
+        x0 = std::min(x0, r.x); y0 = std::min(y0, r.y);
+        x1 = std::max(x1, r.x + r.w); y1 = std::max(y1, r.y + r.h);
+    }
+    layout.monitors = rects;
+    layout.min_x = x0; layout.min_y = y0;
+    layout.width = x1 - x0; layout.height = y1 - y0;
+    return layout;
+}
+
+std::mutex g_layout_mutex;
+Layout g_layout;
+// Monitor the cursor is currently on (index into layout.monitors), -1 = unknown.
+// Positions that fall in dead space are clamped onto this monitor, so the
+// cursor slides along its edge instead of jumping to whichever monitor is nearest.
+int g_current_monitor = -1;
+std::chrono::steady_clock::time_point g_layout_time{};
+
+Layout current_layout(bool force = false) {
+    std::lock_guard<std::mutex> lock(g_layout_mutex);
+    auto now = std::chrono::steady_clock::now();
+    if (force || g_layout.monitors.empty() || now - g_layout_time > std::chrono::seconds(2)) {
+        Layout fresh = parse_hyprctl_monitors();
+        if (!fresh.monitors.empty()) g_layout = fresh;
+        g_layout_time = now;
+    }
+    return g_layout;
+}
+
+// x, y are relative to the bounding box origin. If the point is on a monitor it is
+// kept as-is; otherwise it is clamped onto the current monitor (or the nearest
+// one if the current monitor is unknown).
+void clamp_to_monitors(const Layout& layout, double& x, double& y) {
+    if (layout.monitors.empty()) return;
+    double lx = x + layout.min_x, ly = y + layout.min_y;
+    for (size_t i = 0; i < layout.monitors.size(); ++i) {
+        auto& r = layout.monitors[i];
+        if (lx >= r.x && lx < r.x + r.w && ly >= r.y && ly < r.y + r.h) {
+            g_current_monitor = static_cast<int>(i);
+            return;
+        }
+    }
+    if (g_current_monitor >= 0 && g_current_monitor < static_cast<int>(layout.monitors.size())) {
+        auto& r = layout.monitors[g_current_monitor];
+        x = std::clamp(lx, r.x, r.x + r.w - 1) - layout.min_x;
+        y = std::clamp(ly, r.y, r.y + r.h - 1) - layout.min_y;
+        return;
+    }
+    double best_x = lx, best_y = ly, best_d = -1;
+    for (auto& r : layout.monitors) {
+        double cx = std::clamp(lx, r.x, r.x + r.w - 1);
+        double cy = std::clamp(ly, r.y, r.y + r.h - 1);
+        double d = (cx - lx) * (cx - lx) + (cy - ly) * (cy - ly);
+        if (best_d < 0 || d < best_d) { best_d = d; best_x = cx; best_y = cy; g_current_monitor = static_cast<int>(&r - &layout.monitors[0]); }
+    }
+    x = best_x - layout.min_x;
+    y = best_y - layout.min_y;
+}
+
+// Turns Synergy's absolute positions into a cursor position that never
+// overshoots into dead space. The cursor follows Synergy's *movement*, scaled
+// per axis so that the cursor reaches a layout edge exactly when Synergy's
+// position reaches the matching edge of its rectangle. Any gap left by pushing
+// against a wall therefore shrinks smoothly, and Synergy hitting the edge of its
+// rectangle never stops the cursor short of the real screen edge.
+struct AbsTracker {
+    bool have_prev = false;
+    double raw_x = 0, raw_y = 0;   // last position Synergy sent
+    double real_x = 0, real_y = 0; // last position we sent to Hyprland
+};
+AbsTracker g_abs;
+
+double follow_axis(double raw_prev, double raw_new, double real_prev, double extent) {
+    double d = raw_new - raw_prev;
+    if (d == 0) return real_prev;
+    double hi = extent - 1;
+    double raw_room = d < 0 ? raw_prev : hi - raw_prev;   // distance to Synergy's bound
+    double real_room = d < 0 ? real_prev : hi - real_prev; // distance to layout bound
+    double factor = raw_room > 0.5 ? real_room / raw_room : 12.0;
+    factor = std::clamp(factor, 0.25, 12.0);
+    double out = real_prev + d * factor;
+    if ((d < 0 && raw_new <= 0) || (d > 0 && raw_new >= hi)) out = d < 0 ? 0 : hi;
+    return std::clamp(out, 0.0, hi);
+}
+
+void track_absolute(const Layout& layout, double& x, double& y) {
+    double rx = x, ry = y;
+    double dx = rx - g_abs.raw_x, dy = ry - g_abs.raw_y;
+    if (!g_abs.have_prev || std::abs(dx) > 400 || std::abs(dy) > 400) {
+        // Entry point or jump: go where Synergy says, onto the nearest monitor.
+        g_current_monitor = -1;
+    } else {
+        x = follow_axis(g_abs.raw_x, rx, g_abs.real_x, layout.width);
+        y = follow_axis(g_abs.raw_y, ry, g_abs.real_y, layout.height);
+    }
+    clamp_to_monitors(layout, x, y);
+    g_abs = {true, rx, ry, x, y};
+}
+} // namespace
 }
 
 static const char* PORTAL_INTERFACE = "org.freedesktop.impl.portal.RemoteDesktop";
@@ -730,7 +880,12 @@ void Portal::handle_eis_event(struct eis_event* event) {
             
             // Set pointer region (screen size)
             struct eis_region* region = eis_device_new_region(pointer);
-            eis_region_set_size(region, 1920, 1080); // TODO: Get actual screen size
+            {
+                Layout layout = current_layout(true);
+                eis_region_set_size(region, static_cast<uint32_t>(layout.width), static_cast<uint32_t>(layout.height));
+                std::cout << "EIS: Pointer region " << layout.width << "x" << layout.height
+                          << " across " << layout.monitors.size() << " monitor(s)" << std::endl;
+            }
             eis_region_add(region);
             
             eis_device_add(pointer);
@@ -777,6 +932,8 @@ void Portal::handle_eis_event(struct eis_event* event) {
         case EIS_EVENT_DEVICE_START_EMULATING: {
             struct eis_device* device = eis_event_get_device(event);
             std::cout << "🎮 EIS: Device started emulating: " << eis_device_get_name(device) << std::endl;
+            g_current_monitor = -1; // cursor (re)entered this screen
+            g_abs.have_prev = false;
             break;
         }
         
@@ -813,8 +970,11 @@ void Portal::handle_eis_event(struct eis_event* event) {
             if (libei_handler && libei_handler->pointer) {
                 uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
-                libei_handler->pointer->send_motion_absolute(time, 
-                    static_cast<uint32_t>(x), static_cast<uint32_t>(y), 1920, 1080);
+                Layout layout = current_layout();
+                track_absolute(layout, x, y);
+                libei_handler->pointer->send_motion_absolute(time,
+                    static_cast<uint32_t>(std::lround(x)), static_cast<uint32_t>(std::lround(y)),
+                    static_cast<uint32_t>(layout.width), static_cast<uint32_t>(layout.height));
                 libei_handler->pointer->send_frame();
                 std::cout << "✅ Absolute motion forwarded to virtual pointer" << std::endl;
             }
