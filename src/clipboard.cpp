@@ -51,7 +51,10 @@ struct WaylandClipboard::Listeners {
     static void offer_offer(void* data, ext_data_control_offer_v1* offer, const char* mime) {
         auto* self = static_cast<WaylandClipboard*>(data);
         auto it = self->offers_.find(offer);
-        if (it != self->offers_.end()) it->second.emplace_back(mime);
+        // Some apps (Chromium) offer a type twice; keep the list unique.
+        if (it != self->offers_.end() &&
+            std::find(it->second.begin(), it->second.end(), mime) == it->second.end())
+            it->second.emplace_back(mime);
     }
 
     static void device_data_offer(void* data, ext_data_control_device_v1*,
