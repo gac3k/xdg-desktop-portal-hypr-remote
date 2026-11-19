@@ -27,6 +27,7 @@ extern "C" {
 // of a non-rectangular layout. We advertise the real bounding box and clamp
 // every absolute position onto the nearest monitor.
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
 #include <vector>
 #include <mutex>
@@ -174,6 +175,27 @@ static const char* PORTAL_ERROR_FAILED = "org.freedesktop.portal.Error.Failed";
 
 static void reply_failed(sdbus::MethodCall& call, const std::string& message) {
     call.createErrorReply(sdbus::Error(sdbus::Error::Name{PORTAL_ERROR_FAILED}, message)).send();
+}
+
+// HYPR_REMOTE_ALLOWED_APP_IDS: comma-separated app IDs allowed to Start a session.
+// Unset: only "" (host apps). An empty item means host apps; "*" allows all.
+static bool app_id_allowed(const std::string& app_id) {
+    static const std::vector<std::string> allowed = [] {
+        std::vector<std::string> out;
+        const char* env = std::getenv("HYPR_REMOTE_ALLOWED_APP_IDS");
+        std::string s = env ? env : "";
+        size_t start = 0;
+        while (true) {
+            size_t comma = s.find(',', start);
+            out.push_back(s.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        return out;
+    }();
+    for (const auto& a : allowed)
+        if (a == "*" || a == app_id) return true;
+    return false;
 }
 
 // Use development name if requested, otherwise use standard name
@@ -438,6 +460,16 @@ void Portal::Start(sdbus::MethodCall call) {
         return;
     }
     
+    if (!app_id_allowed(app_id)) {
+        std::cout << "Start: denied for app_id '" << app_id
+                  << "' (not in HYPR_REMOTE_ALLOWED_APP_IDS)" << std::endl;
+        auto reply = call.createReply();
+        reply << static_cast<uint32_t>(2); // Other
+        reply << std::map<std::string, sdbus::Variant>{};
+        reply.send();
+        return;
+    }
+
     std::cout << "✅ Using existing LibEI handler for input processing" << std::endl;
     
     // Start the remote desktop session
@@ -450,6 +482,7 @@ void Portal::Start(sdbus::MethodCall call) {
         std::lock_guard<std::mutex> lock(sessions_mtx);
         auto& state = sessions[session_handle];
         clipboard_enabled = clipboard_enabled && state.clipboard_requested;
+        state.allowed = true;
     }
     if (clipboard_enabled) response["clipboard_enabled"] = sdbus::Variant(true);
     std::cout << "Start: clipboard_enabled=" << (clipboard_enabled ? "true" : "false") << std::endl;
@@ -626,6 +659,18 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
         return;
     }
     
+    bool allowed = false;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        auto it = sessions.find(session_handle);
+        allowed = it != sessions.end() && it->second.allowed;
+    }
+    if (!allowed) {
+        std::cout << "ConnectToEIS: refused, session not started" << std::endl;
+        reply_failed(call, "Session not started");
+        return;
+    }
+
     if (eis_shutdown.load()) {
         reply_failed(call, "Shutting down");
         return;

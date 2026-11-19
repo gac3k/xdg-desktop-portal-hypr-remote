@@ -37,6 +37,7 @@ private:
     // signal while holding sessions_mtx.
     struct SessionState {
         bool clipboard_requested = false;
+        bool allowed = false;   // Start accepted this session's app_id
         std::unique_ptr<sdbus::IObject> obj;   // org.freedesktop.impl.portal.Session
     };
     std::mutex sessions_mtx;
