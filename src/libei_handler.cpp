@@ -107,6 +107,7 @@ void LibEIHandler::stop() {
 }
 
 void LibEIHandler::handle_event(struct ei_event* event) {
+    std::lock_guard<std::mutex> lock(input_mutex);
     enum ei_event_type type = ei_event_get_type(event);
     
     switch (type) {

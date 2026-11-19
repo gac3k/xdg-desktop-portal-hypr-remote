@@ -489,11 +489,14 @@ void Portal::NotifyPointerMotion(sdbus::MethodCall call) {
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual pointer via libei handler's virtual pointer
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->pointer) {
         libei_handler->pointer->send_motion(time, dx, dy);
         libei_handler->pointer->send_frame();
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
@@ -513,11 +516,14 @@ void Portal::NotifyPointerButton(sdbus::MethodCall call) {
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual pointer
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->pointer) {
         libei_handler->pointer->send_button(time, static_cast<uint32_t>(button), state);
         libei_handler->pointer->send_frame();
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
@@ -537,10 +543,13 @@ void Portal::NotifyKeyboardKeycode(sdbus::MethodCall call) {
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual keyboard
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->keyboard) {
         libei_handler->keyboard->send_key(time, static_cast<uint32_t>(keycode), state);
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
@@ -559,6 +568,8 @@ void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual pointer with proper Wayland scroll protocol
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->pointer) {
         // Set axis source for legacy scroll events
         libei_handler->pointer->send_axis_source(WL_POINTER_AXIS_SOURCE_WHEEL);
@@ -575,6 +586,7 @@ void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
         libei_handler->pointer->send_frame();
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
@@ -808,6 +820,8 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
 }
 
 void Portal::handle_eis_event(struct eis_event* event) {
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     enum eis_event_type type = eis_event_get_type(event);
     
     // Log all events for debugging
