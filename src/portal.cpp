@@ -44,7 +44,7 @@ struct Layout {
 
 Layout parse_hyprctl_monitors() {
     Layout layout;
-    FILE* pipe = popen("hyprctl monitors 2>/dev/null", "r");
+    FILE* pipe = popen("hyprctl monitors 2>/dev/null", "re");
     if (!pipe) return layout;
     std::vector<LayoutRect> rects;
     char line[512];
@@ -90,15 +90,11 @@ Layout g_layout;
 // Positions that fall in dead space are clamped onto this monitor, so the
 // cursor slides along its edge instead of jumping to whichever monitor is nearest.
 int g_current_monitor = -1;
-std::chrono::steady_clock::time_point g_layout_time{};
-
 Layout current_layout(bool force = false) {
     std::lock_guard<std::mutex> lock(g_layout_mutex);
-    auto now = std::chrono::steady_clock::now();
-    if (force || g_layout.monitors.empty() || now - g_layout_time > std::chrono::seconds(2)) {
+    if (force || g_layout.monitors.empty()) {
         Layout fresh = parse_hyprctl_monitors();
         if (!fresh.monitors.empty()) g_layout = fresh;
-        g_layout_time = now;
     }
     return g_layout;
 }
@@ -624,7 +620,7 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
     
     // Create a socket pair - one end for deskflow, one end for our EIS server
     int socket_pair[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, socket_pair) == -1) {
+    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, socket_pair) == -1) {
         std::cerr << "Error creating socket pair: " << strerror(errno) << std::endl;
         call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to create socket pair")).send();
         return;
@@ -677,7 +673,7 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
             std::cout << "🌉 Starting socket bridge..." << std::endl;
             
             // Connect to the EIS socket
-            int eis_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+            int eis_sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
             if (eis_sock == -1) {
                 std::cerr << "Failed to create bridge socket" << std::endl;
                 return;
@@ -935,6 +931,9 @@ void Portal::handle_eis_event(struct eis_event* event) {
             struct eis_device* device = eis_event_get_device(event);
             std::cout << "🎮 EIS: Device started emulating: " << eis_device_get_name(device) << std::endl;
             g_current_monitor = -1; // cursor (re)entered this screen
+            // Pick up monitor changes here, not during motion. (The pointer region
+            // size is still fixed at SEAT_BIND; that limitation is unchanged.)
+            current_layout(true);
             g_abs.have_prev = false;
             break;
         }
