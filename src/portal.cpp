@@ -10,13 +10,9 @@
 #include <cstring>
 #include <cerrno>
 #include <unistd.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <poll.h>
 #include <algorithm>
 #include <sys/mman.h>
-#include <fcntl.h>
 
 extern "C" {
 #include <libei.h>
@@ -253,6 +249,16 @@ bool Portal::init(LibEIHandler* handler, WaylandClipboard* clip) {
 }
 
 void Portal::cleanup() {
+    // EIS server threads capture `this` and drive the virtual devices, so wait
+    // for them before anything is torn down. Idempotent: ~Portal calls this
+    // again, when the count is already 0.
+    eis_shutdown = true;
+    {
+        std::unique_lock<std::mutex> lk(eis_mtx);
+        if (!eis_cv.wait_for(lk, std::chrono::seconds(3), [this] { return eis_threads == 0; }))
+            std::cerr << eis_threads << " EIS thread(s) still running at shutdown" << std::endl;
+    }
+
     // Session objects must go before the connection. The clipboard thread has
     // been stopped by now (main stops it before cleanup()). Destroy them outside
     // sessions_mtx: destroying an object takes the sdbus lock, and method
@@ -295,6 +301,8 @@ void Portal::run() {
 }
 
 void Portal::stop() {
+    // EIS server threads see this within 100 ms; cleanup() waits for them.
+    eis_shutdown = true;
     // Exit the sdbus event loop cleanly
     if (connection) {
         connection->leaveEventLoop();
@@ -618,201 +626,121 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
         return;
     }
     
-    // Create a socket pair - one end for deskflow, one end for our EIS server
-    int socket_pair[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, socket_pair) == -1) {
-        std::cerr << "Error creating socket pair: " << strerror(errno) << std::endl;
-        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to create socket pair")).send();
+    if (eis_shutdown.load()) {
+        reply_failed(call, "Shutting down");
         return;
     }
-    
-    int client_fd = socket_pair[0];  // This goes to deskflow
-    int server_fd = socket_pair[1];  // This stays with us for EIS server
-    
-    std::cout << "✅ Created socket pair - client_fd: " << client_fd << ", server_fd: " << server_fd << std::endl;
-    
-    // Start a thread to run a proper EIS server
-    std::thread([this, server_fd]() {
-        std::cout << "📡 Starting proper EIS server thread..." << std::endl;
-        
-        // Create EIS server context (similar to hyprland-eis)
-        struct eis* eis_context = eis_new(nullptr);
-        if (!eis_context) {
-            std::cerr << "Failed to create EIS server context" << std::endl;
-            close(server_fd);
-            return;
-        }
-        
-        // Set up logging (optional, for debugging)
-        // eis_log_set_priority(eis_context, EIS_LOG_PRIORITY_DEBUG);
-        
-        std::cout << "✅ EIS server context created" << std::endl;
-        
-        // Create a temporary socket and immediately connect our FD to it
-        // This is a workaround since libeis may not support direct FD setup
-        
-        // Alternative approach: Create a proper EIS server socket and handle the connection
-        char socket_path[256];
-        static std::atomic<unsigned> eis_session_counter{0};
-        snprintf(socket_path, sizeof(socket_path), "/tmp/hypr-portal-eis-%d-%u", getpid(), eis_session_counter++);
-        
-        // Setup EIS backend with temporary socket
-        int rc = eis_setup_backend_socket(eis_context, socket_path);
-        if (rc != 0) {
-            std::cerr << "Failed to setup EIS backend socket: " << strerror(errno) << std::endl;
-            eis_unref(eis_context);
-            close(server_fd);
-            return;
-        }
-        
-        std::cout << "✅ EIS backend socket created at: " << socket_path << std::endl;
-        
-        // Now we need to bridge between our socket_pair and the EIS socket
-        // Start a bridge thread to forward data between them
-        std::thread bridge_thread([server_fd, socket_path]() {
-            std::cout << "🌉 Starting socket bridge..." << std::endl;
-            
-            // Connect to the EIS socket
-            int eis_sock = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-            if (eis_sock == -1) {
-                std::cerr << "Failed to create bridge socket" << std::endl;
-                return;
-            }
-            
-            struct sockaddr_un addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sun_family = AF_UNIX;
-            snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", socket_path);
-            
-            // Wait a bit for the EIS server to start
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            
-            if (connect(eis_sock, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-                std::cerr << "Failed to connect to EIS socket: " << strerror(errno) << std::endl;
-                close(eis_sock);
-                return;
-            }
-            
-            std::cout << "✅ Bridge connected to EIS socket" << std::endl;
-            
-            // Bridge data bidirectionally between server_fd and eis_sock
-            fd_set read_fds;
-            char buffer[4096];
-            
-            // Make sockets non-blocking for better performance
-            int flags = fcntl(server_fd, F_GETFL, 0);
-            fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
-            flags = fcntl(eis_sock, F_GETFL, 0);
-            fcntl(eis_sock, F_SETFL, flags | O_NONBLOCK);
-            
-            while (true) {
-                FD_ZERO(&read_fds);
-                FD_SET(server_fd, &read_fds);
-                FD_SET(eis_sock, &read_fds);
-                
-                int max_fd = std::max(server_fd, eis_sock);
-                struct timeval timeout = {0, 100000}; // 100ms timeout for better responsiveness
-                
-                int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &timeout);
-                
-                if (activity < 0) {
-                    std::cerr << "Bridge select error: " << strerror(errno) << std::endl;
+
+    // libeis fd backend: libeis makes a socket pair and keeps one end; the other
+    // goes to deskflow. No socket file and no relay thread (CLIPBOARD-PLAN.md §3.2, S3).
+    struct eis* eis_context = eis_new(nullptr);
+    if (!eis_context || eis_setup_backend_fd(eis_context) != 0) {
+        std::cerr << "Failed to set up EIS fd backend" << std::endl;
+        if (eis_context) eis_unref(eis_context);
+        reply_failed(call, "Failed to set up EIS");
+        return;
+    }
+
+    int client_fd = eis_backend_fd_add_client(eis_context);
+    if (client_fd < 0) {
+        std::cerr << "Failed to add EIS client fd: " << strerror(-client_fd) << std::endl;
+        eis_unref(eis_context);
+        reply_failed(call, "Failed to set up EIS");
+        return;
+    }
+
+    // Count the thread before it exists, so that cleanup() can't miss it.
+    {
+        std::lock_guard<std::mutex> lock(eis_mtx);
+        ++eis_threads;
+    }
+
+    // From here on only the new thread touches eis_context.
+    try {
+        std::thread([this, eis_context]() {
+            // Declared first so that it runs last: after this, the thread no longer
+            // touches `this`.
+            struct Guard {
+                Portal* p;
+                ~Guard() {
+                    std::lock_guard<std::mutex> l(p->eis_mtx);
+                    --p->eis_threads;
+                    p->eis_cv.notify_all();
+                }
+            } guard{this};
+
+            std::cout << "🚀 Starting EIS server event loop..." << std::endl;
+
+            bool stop = false;
+            // libeis reports nothing if the fd is closed before the client ever
+            // connects, so give up on our own after a while.
+            bool connected = false;
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            struct pollfd fds = {
+                .fd = eis_get_fd(eis_context),
+                .events = POLLIN,
+                .revents = 0,
+            };
+
+            while (!stop && !eis_shutdown.load()) {
+                if (!connected && std::chrono::steady_clock::now() >= deadline) {
+                    std::cout << "EIS: client never connected; stopping" << std::endl;
                     break;
                 }
-                
-                if (activity == 0) continue; // timeout
-                
-                // Forward data from deskflow (server_fd) to EIS server (eis_sock)
-                if (FD_ISSET(server_fd, &read_fds)) {
-                    ssize_t bytes = read(server_fd, buffer, sizeof(buffer));
-                    if (bytes <= 0) {
-                        if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                            std::cout << "Deskflow disconnected from bridge" << std::endl;
-                            break;
-                        }
-                    } else {
-                        if (write(eis_sock, buffer, bytes) != bytes) {
-                            std::cerr << "Failed to forward data to EIS server" << std::endl;
-                            break;
-                        }
-                        //std::cout << "🔄 Forwarded " << bytes << " bytes from deskflow to EIS" << std::endl;
-                    }
+
+                int nevents = poll(&fds, 1, 100); // 100 ms, so that shutdown and the deadline are seen
+                if (nevents == -1) {
+                    if (errno == EINTR) continue;
+                    std::cerr << "EIS poll error: " << strerror(errno) << std::endl;
+                    break;
                 }
-                
-                // Forward data from EIS server (eis_sock) to deskflow (server_fd)
-                if (FD_ISSET(eis_sock, &read_fds)) {
-                    ssize_t bytes = read(eis_sock, buffer, sizeof(buffer));
-                    if (bytes <= 0) {
-                        if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                            std::cout << "EIS server disconnected from bridge" << std::endl;
-                            break;
-                        }
-                    } else {
-                        if (write(server_fd, buffer, bytes) != bytes) {
-                            std::cerr << "Failed to forward data to deskflow" << std::endl;
-                            break;
-                        }
-                        //std::cout << "🔄 Forwarded " << bytes << " bytes from EIS to deskflow" << std::endl;
-                    }
+
+                if (nevents == 0) continue; // timeout
+
+                // Process all pending EIS events in one go - this is crucial for scroll
+                eis_dispatch(eis_context);
+
+                // Handle ALL events in the queue immediately
+                struct eis_event* event;
+                while ((event = eis_get_event(eis_context)) != nullptr) {
+
+                    // Handle EIS events and forward to virtual devices
+                    enum eis_event_type type = eis_event_get_type(event);
+                    if (type == EIS_EVENT_CLIENT_CONNECT) connected = true;
+                    bool client_gone = type == EIS_EVENT_CLIENT_DISCONNECT;
+                    handle_eis_event(event);
+                    eis_event_unref(event);
+                    if (client_gone) stop = true;
                 }
             }
-            
-            std::cout << "🌉 Socket bridge stopped" << std::endl;
-            close(eis_sock);
-        });
-        bridge_thread.detach();
-        
-        // Run the EIS server event loop (adapted from hyprland-eis)
-        std::cout << "🚀 Starting EIS server event loop..." << std::endl;
-        
-        bool stop = false;
-        struct pollfd fds = {
-            .fd = eis_get_fd(eis_context),
-            .events = POLLIN,
-            .revents = 0,
-        };
-        
-        while (!stop) {
-            int nevents = poll(&fds, 1, 100); // Reduced timeout to 100ms for better responsiveness
-            if (nevents == -1) {
-                std::cerr << "EIS poll error: " << strerror(errno) << std::endl;
-                break;
-            }
-            
-            if (nevents == 0) continue; // timeout
-            
-            // Process all pending EIS events in one go - this is crucial for scroll
-            eis_dispatch(eis_context);
-            
-            // Handle ALL events in the queue immediately
-            struct eis_event* event;
-            while ((event = eis_get_event(eis_context)) != nullptr) {
-                
-                // Handle EIS events and forward to virtual devices
-                bool client_gone = eis_event_get_type(event) == EIS_EVENT_CLIENT_DISCONNECT;
-                handle_eis_event(event);
-                eis_event_unref(event);
-                if (client_gone) stop = true;
-            }
+
+            std::cout << "📡 EIS server thread stopped" << std::endl;
+            eis_unref(eis_context);
+        }).detach();
+    } catch (const std::system_error& e) {
+        std::cerr << "Failed to start EIS server thread: " << e.what() << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(eis_mtx);
+            --eis_threads;
         }
-        
-        std::cout << "📡 EIS server thread stopped" << std::endl;
-        unlink(socket_path); // Clean up socket file
+        eis_cv.notify_all();
         eis_unref(eis_context);
-        close(server_fd);
-    }).detach();
-    
-    // Return the client file descriptor to deskflow
+        close(client_fd);
+        reply_failed(call, "Failed to set up EIS");
+        return;
+    }
+
+    // Return the client file descriptor to deskflow. client_fd comes from libeis
+    // (eis_backend_fd_add_client); libeis keeps its own end. UnixFd adopts
+    // client_fd (no dup), the bus dups it into the reply, and UnixFd closes our
+    // copy when it goes out of scope after the reply is sent. client_fd must not
+    // be closed elsewhere.
+    sdbus::UnixFd unix_fd{client_fd, sdbus::adopt_fd};
     auto reply = call.createReply();
-    
-    // Create a unix file descriptor object and pass it to the client
-    sdbus::UnixFd unix_fd{client_fd};
     reply << unix_fd;
     reply.send();
-    
-    std::cout << "✅ ConnectToEIS completed - socket fd sent to deskflow" << std::endl;
-    std::cout << "🎯 Deskflow can now send EIS events through fd " << client_fd << std::endl;
-    std::cout << "📡 Proper EIS server thread is running with socket bridge" << std::endl;
+
+    std::cout << "✅ ConnectToEIS completed - EIS client fd sent to deskflow" << std::endl;
 }
 
 void Portal::handle_eis_event(struct eis_event* event) {

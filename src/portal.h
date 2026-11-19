@@ -1,6 +1,8 @@
 #pragma once
 
 #include <sdbus-c++/sdbus-c++.h>
+#include <atomic>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -41,7 +43,13 @@ private:
     std::map<std::string, SessionState> sessions;
     std::vector<std::unique_ptr<sdbus::IObject>> retired;  // closed Session objects
     std::string clip_session;                              // "" = none
-    
+
+    // EIS server threads (one per ConnectToEIS). cleanup() waits for them.
+    std::atomic<bool> eis_shutdown{false};
+    std::mutex eis_mtx;
+    std::condition_variable eis_cv;
+    int eis_threads = 0;   // guarded by eis_mtx
+
     // Modifier state tracking for proper key combination handling
     uint32_t modifier_state_depressed = 0;
     uint32_t modifier_state_latched = 0;
