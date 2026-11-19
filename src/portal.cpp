@@ -283,14 +283,20 @@ void Portal::cleanup() {
     running = false;
 
     // Session objects must go before the connection. The clipboard thread has
-    // been stopped by now (main stops it before cleanup()).
+    // been stopped by now (main stops it before cleanup()). Destroy them outside
+    // sessions_mtx: destroying an object takes the sdbus lock, and method
+    // handlers run under that lock and take sessions_mtx (lock order).
+    std::map<std::string, SessionState> closing;
+    std::vector<std::unique_ptr<sdbus::IObject>> closing_retired;
     {
         std::lock_guard<std::mutex> lock(sessions_mtx);
-        sessions.clear();
-        retired.clear();
+        closing.swap(sessions);
+        closing_retired.swap(retired);
         clip_session.clear();
     }
-    
+    closing.clear();
+    closing_retired.clear();
+
     if (object) {
         object.reset();
     }
@@ -488,12 +494,13 @@ void Portal::Start(sdbus::MethodCall call) {
     std::map<std::string, sdbus::Variant> response;
     response["devices"] = sdbus::Variant(static_cast<uint32_t>(7)); // keyboard | pointer | touchscreen
 
-    bool clipboard_enabled = false;
+    // Ask the clipboard before taking sessions_mtx (see portal.h).
+    bool clipboard_enabled = clipboard && clipboard->available();
     {
         std::lock_guard<std::mutex> lock(sessions_mtx);
         auto& state = sessions[session_handle];
         state.started = true;
-        clipboard_enabled = state.clipboard_requested && clipboard && clipboard->available();
+        clipboard_enabled = clipboard_enabled && state.clipboard_requested;
     }
     if (clipboard_enabled) response["clipboard_enabled"] = sdbus::Variant(true);
     std::cout << "Start: clipboard_enabled=" << (clipboard_enabled ? "true" : "false") << std::endl;

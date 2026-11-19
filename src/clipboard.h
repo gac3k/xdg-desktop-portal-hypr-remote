@@ -33,9 +33,10 @@
  *    IObject.h:469-470: createObject is safe on a connection that is already
  *    running its event loop (used for Session objects in 3).
  *  - libsdbus-c++.so.2.3.1 imports pthread_mutex_lock and eventfd_write (a bus lock
- *    plus loop wake-up). A handler may run under that lock, so: never call a
- *    callback or emitSignal while holding WaylandClipboard::mtx or Portal's
- *    sessions_mtx. Copy what is needed, unlock, then emit.
+ *    plus loop wake-up). Handlers run under that lock (ThreadSanitizer confirms
+ *    it), so: never call a callback or emitSignal, and never create or destroy an
+ *    sdbus object, while holding WaylandClipboard::mtx or Portal's sessions_mtx.
+ *    Copy what is needed, unlock, then emit.
  *  - `object` must outlive the thread: clipboard.stop() runs before portal.cleanup().
  *
  * 3. SESSIONS (Portal): std::map<std::string, SessionState> under sessions_mtx,
