@@ -31,6 +31,13 @@ std::string join(const std::vector<std::string>& mimes) {
 
 } // namespace
 
+bool valid_mime_type(const std::string& mime) {
+    if (mime.empty() || mime.size() > kMaxMimeLen) return false;
+    for (unsigned char c : mime)
+        if (c < 0x20 || c > 0x7E) return false;
+    return true;
+}
+
 // ---- Listeners (all run on the Wayland thread) ------------------------------
 
 struct WaylandClipboard::Listeners {
@@ -52,6 +59,8 @@ struct WaylandClipboard::Listeners {
         auto* self = static_cast<WaylandClipboard*>(data);
         auto it = self->offers_.find(offer);
         // Some apps (Chromium) offer a type twice; keep the list unique.
+        if (!valid_mime_type(mime)) return;
+        if (it != self->offers_.end() && it->second.size() >= kMaxMimeTypes) return;
         if (it != self->offers_.end() &&
             std::find(it->second.begin(), it->second.end(), mime) == it->second.end())
             it->second.emplace_back(mime);
@@ -94,7 +103,10 @@ struct WaylandClipboard::Listeners {
 
     static void source_cancelled(void* data, ext_data_control_source_v1* source) {
         auto* self = static_cast<WaylandClipboard*>(data);
-        if (source == self->source_) self->source_ = nullptr;
+        if (source == self->source_) {
+            self->source_ = nullptr;
+            self->claimed_mimes_.clear();
+        }
         ext_data_control_source_v1_destroy(source);
     }
 
@@ -168,7 +180,16 @@ void WaylandClipboard::stop() {
 
 void WaylandClipboard::claim(std::vector<std::string> mimes) {
     if (!available_) return;
-    push_command(Command{Command::Claim, std::move(mimes), -1});
+    size_t dropped = 0;
+    std::vector<std::string> ok;
+    for (auto& m : mimes) {
+        if (!valid_mime_type(m) || ok.size() >= kMaxMimeTypes) { ++dropped; continue; }
+        ok.push_back(std::move(m));
+    }
+    if (dropped > 0)
+        std::cerr << "clipboard: dropped " << dropped << " invalid MIME type(s)" << std::endl;
+    if (ok.empty()) return;
+    push_command(Command{Command::Claim, std::move(ok), -1});
 }
 
 int WaylandClipboard::take_write_fd(uint32_t serial) {
@@ -211,6 +232,10 @@ void WaylandClipboard::write_done(uint32_t serial, bool ok) {
 
 int WaylandClipboard::open_read(const std::string& mime) {
     if (!available_ || mime == kOwnedMarker) return -1;
+    if (!valid_mime_type(mime)) {
+        std::cerr << "clipboard: local->remote invalid MIME type requested" << std::endl;
+        return -1;
+    }
     std::lock_guard<std::mutex> lock(mtx_);
     if (loop_exited_ ||
         std::find(foreign_mimes_.begin(), foreign_mimes_.end(), mime) == foreign_mimes_.end()) {
@@ -297,9 +322,19 @@ void WaylandClipboard::on_send(ext_data_control_source_v1* /*source*/, const cha
         close(fd);
         return;
     }
+    if (std::find(claimed_mimes_.begin(), claimed_mimes_.end(), mime) == claimed_mimes_.end()) {
+        close(fd);
+        std::cerr << "clipboard: remote->local paste of a type we did not offer refused" << std::endl;
+        return;
+    }
     uint32_t serial;
     {
         std::lock_guard<std::mutex> lock(mtx_);
+        if (pending_.size() >= kMaxPending) {
+            close(fd);
+            std::cerr << "clipboard: remote->local too many pending pastes; refused" << std::endl;
+            return;
+        }
         do {
             serial = ++serial_counter_;
         } while (serial == 0 || pending_.count(serial));
@@ -332,6 +367,7 @@ void WaylandClipboard::run_command(Command& cmd, bool& stop_requested) {
         ext_data_control_device_v1_set_selection(device_, src);
         if (source_) ext_data_control_source_v1_destroy(source_);
         source_ = src;
+        claimed_mimes_ = cmd.mimes;
         std::cout << "clipboard: remote selection claimed: " << join(cmd.mimes) << std::endl;
         break;
     }
@@ -371,6 +407,7 @@ void WaylandClipboard::run_command(Command& cmd, bool& stop_requested) {
         if (source_) {
             ext_data_control_source_v1_destroy(source_);
             source_ = nullptr;
+            claimed_mimes_.clear();
             std::cout << "clipboard: session ended, remote selection dropped" << std::endl;
         }
         break;
@@ -479,6 +516,7 @@ void WaylandClipboard::teardown_wayland() {
     offers_.clear();
     selection_offer_ = nullptr;
     if (source_) { ext_data_control_source_v1_destroy(source_); source_ = nullptr; }
+    claimed_mimes_.clear();
     if (device_) { ext_data_control_device_v1_destroy(device_); device_ = nullptr; }
     if (manager_) { ext_data_control_manager_v1_destroy(manager_); manager_ = nullptr; }
     if (seat_) { wl_seat_destroy(seat_); seat_ = nullptr; }

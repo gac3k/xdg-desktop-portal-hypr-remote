@@ -108,6 +108,9 @@
  * 6. LIMITS: with (b) there is no portal-side size cap (we never see the bytes);
  *    Synergy's clipboardSharingSize applies. 5 s deadline for SelectionWrite. main
  *    still sets signal(SIGPIPE, SIG_IGN): the EIS bridge write()s to sockets.
+ *    MIME types must be 1-255 bytes of printable ASCII (0x20-0x7E); at most 64 per
+ *    selection; others are dropped. At most 32 pastes pending; more are refused
+ *    (empty paste).
  * 7. LOGGING: lifecycle events, plus one line per transfer with direction, mime,
  *    serial and outcome (handed over / done ok / failed / timed out). Sizes aren't
  *    known under (b). Never log contents. Required lines: "clipboard requested",
@@ -124,6 +127,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -142,6 +146,10 @@ struct ext_data_control_source_v1;
 struct ext_data_control_offer_v1;
 
 inline constexpr const char* kOwnedMarker = "application/x-hypr-remote-owned";
+inline constexpr size_t kMaxMimeLen = 255, kMaxMimeTypes = 64, kMaxPending = 32;
+
+// 1..kMaxMimeLen bytes, each printable ASCII (0x20-0x7E).
+bool valid_mime_type(const std::string& mime);
 
 // Called on the Wayland thread, never with a WaylandClipboard lock held.
 struct ClipboardCallbacks {
@@ -209,6 +217,7 @@ private:
     ext_data_control_manager_v1* manager_ = nullptr;
     ext_data_control_device_v1* device_ = nullptr;
     ext_data_control_source_v1* source_ = nullptr;    // our current source, if any
+    std::vector<std::string> claimed_mimes_;          // types source_ offers, without the marker
     ext_data_control_offer_v1* selection_offer_ = nullptr;
     std::map<ext_data_control_offer_v1*, std::vector<std::string>> offers_;
 };
