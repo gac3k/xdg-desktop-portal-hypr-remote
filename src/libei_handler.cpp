@@ -39,6 +39,7 @@ bool LibEIHandler::init(WaylandVirtualKeyboard* kb, WaylandVirtualPointer* ptr) 
     
     std::cout << "EI receiver context created for portal file descriptor sharing" << std::endl;
     std::cout << "✓ LibEI Handler initialized successfully" << std::endl;
+    running = true;
     return true;
 }
 
@@ -62,7 +63,7 @@ void LibEIHandler::run() {
         return;
     }
     
-    running = true;
+    // running is set in init(), so a stop() issued before this thread gets here sticks.
     std::cout << "LibEI Handler running and processing events..." << std::endl;
     
     int ei_fd = ei_get_fd(ei_context);

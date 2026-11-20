@@ -70,6 +70,9 @@ int main(int argc, char* argv[]) {
     // Initialize portal; it also initializes the clipboard (clipboard.h, item 9)
     if (!portal.init(&libeiHandler, &clipboard)) {
         std::cerr << "Failed to initialize D-Bus portal" << std::endl;
+        // libei_thread is joinable here; destroying it would call std::terminate.
+        libeiHandler.stop();
+        libei_thread.join();
         libeiHandler.cleanup();
         waylandVP.cleanup();
         waylandVK.cleanup();
