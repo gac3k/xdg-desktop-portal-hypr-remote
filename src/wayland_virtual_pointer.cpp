@@ -1,6 +1,14 @@
 #include "wayland_virtual_pointer.h"
 #include <iostream>
 #include <cstring>
+#include <cmath>
+#include <algorithm>
+
+// wl_fixed_from_double casts round(d * 256) to int32: NaN/inf/out of range is UB.
+static wl_fixed_t to_fixed(double v) {
+    if (!std::isfinite(v)) return 0;
+    return wl_fixed_from_double(std::clamp(v, -8388607.0, 8388607.0));
+}
 
 static const struct wl_registry_listener registry_listener = {
     .global = WaylandVirtualPointer::registry_global,
@@ -96,8 +104,8 @@ void WaylandVirtualPointer::registry_global_remove(void* data, struct wl_registr
 void WaylandVirtualPointer::send_motion(uint32_t time, double dx, double dy) {
     if (virtual_pointer) {
         zwlr_virtual_pointer_v1_motion(virtual_pointer, time, 
-                                     wl_fixed_from_double(dx), 
-                                     wl_fixed_from_double(dy));
+                                     to_fixed(dx), 
+                                     to_fixed(dy));
     }
 }
 
@@ -114,9 +122,9 @@ void WaylandVirtualPointer::send_button(uint32_t time, uint32_t button, uint32_t
     }
 }
 
-void WaylandVirtualPointer::send_axis(uint32_t time, uint32_t axis, double dx, double dy) {
+void WaylandVirtualPointer::send_axis(uint32_t time, uint32_t axis, double value) {
     if (virtual_pointer) {
-        zwlr_virtual_pointer_v1_axis(virtual_pointer, time, axis, wl_fixed_from_double(dx));
+        zwlr_virtual_pointer_v1_axis(virtual_pointer, time, axis, to_fixed(value));
     }
 }
 
@@ -127,7 +135,6 @@ void WaylandVirtualPointer::send_axis_source(uint32_t axis_source) {
 }
 
 void WaylandVirtualPointer::send_axis_discrete(uint32_t time, int32_t dx, int32_t dy) {
-    std::cout << "send_axis_discrete: dx=" << dx << " dy=" << dy << std::endl;
     if (virtual_pointer) {
         if(dy < 0) {
             zwlr_virtual_pointer_v1_axis_discrete(virtual_pointer, time, WL_POINTER_AXIS_VERTICAL_SCROLL, wl_fixed_from_int(-15), -1);

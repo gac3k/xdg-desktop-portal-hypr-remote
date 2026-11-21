@@ -2,18 +2,37 @@
 
 A complete implementation of the `org.freedesktop.impl.portal.RemoteDesktop` portal for Hyprland, providing remote desktop capabilities using libei and Wayland virtual input protocols.
 
+It also implements `org.freedesktop.impl.portal.Clipboard` (text and `image/png`) through `ext-data-control-v1`, so clipboard sharing works with clients such as Synergy and Deskflow.
+
 #### **System Installation**
 
 ```bash
-# Install portal system-wide
-sudo make install
+# Configure, build and install (the install step also installs data/hypr-remote.portal)
+cmake -B build -DDEVELOPMENT_MODE=OFF -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_INSTALL_LIBEXECDIR=lib
+cmake --build build
+sudo cmake --install build
+```
 
-# Copy portal configuration
-sudo cp data/hyprland.portal /usr/share/xdg-desktop-portal/portals/
+The service files expect the binary in `libexecdir` (`/usr/lib/xdg-desktop-portal-hypr-remote`), while `cmake --install` puts it in `bindir`; packagers should move it. The install step does not install the service files; copy the generated ones yourself:
 
-# Restart portal services
+- D-Bus service: `build/org.freedesktop.impl.portal.desktop.hypr-remote.service` to `/usr/share/dbus-1/services/`
+- systemd user unit: `build/contrib/systemd/xdg-desktop-portal-hypr-remote.service` to `/usr/lib/systemd/user/`
+
+Then route the interfaces to this portal in `hyprland-portals.conf` (for example `~/.config/xdg-desktop-portal/hyprland-portals.conf`):
+
+```ini
+[preferred]
+org.freedesktop.impl.portal.RemoteDesktop=hypr-remote
+org.freedesktop.impl.portal.Clipboard=hypr-remote
+```
+
+and restart the portal:
+
+```bash
 systemctl --user restart xdg-desktop-portal
 ```
+
+**Security note:** the portal approves remote-input and clipboard requests without a prompt, but only from host apps (empty `app_id`), such as Synergy run as a systemd user service. Sandboxed apps (Flatpak, Snap) are refused unless their app ID is listed in `HYPR_REMOTE_ALLOWED_APP_IDS` (comma-separated; an empty item means host apps; `*` allows all). Set it with `systemctl --user edit xdg-desktop-portal-hypr-remote`, adding `[Service]` / `Environment=HYPR_REMOTE_ALLOWED_APP_IDS=,org.example.App`. Any unsandboxed process on your session bus can still call the portal directly.
 
 ## 🚀 Quick Start
 
@@ -22,7 +41,7 @@ systemctl --user restart xdg-desktop-portal
 Install dependencies:
 - cmake, pkg-config, gcc
 - wayland-client, wayland-protocols, wayland-scanner
-- libei-1.0, sdbus-c++, systemd
+- libei-1.0 (libei and libeis), sdbus-c++ 2.x, systemd
 
 Then:
 ```bash
@@ -47,10 +66,10 @@ Check if the portal is discoverable:
 busctl --user list | grep portal
 
 # Monitor D-Bus calls to your portal
-busctl --user monitor org.freedesktop.impl.portal.desktop.hyprland.dev
+busctl --user monitor org.freedesktop.impl.portal.desktop.hypr-remote
 
 # Test method calls
-busctl --user call org.freedesktop.impl.portal.desktop.hyprland.dev \
+busctl --user call org.freedesktop.impl.portal.desktop.hypr-remote \
   /org/freedesktop/portal/desktop \
   org.freedesktop.impl.portal.RemoteDesktop \
   CreateSession 'a{sv}' 0
@@ -58,19 +77,23 @@ busctl --user call org.freedesktop.impl.portal.desktop.hyprland.dev \
 ## 📁 Project Structure
 
 ```
-hyprland-remote-desktop/
+xdg-desktop-portal-hypr-remote/
 ├── src/
 │   ├── main.cpp                    # Main application entry point
-│   ├── portal.cpp/.h               # D-Bus portal implementation
+│   ├── portal.cpp/.h               # D-Bus RemoteDesktop implementation, EIS handling
+│   ├── clipboard.cpp/.h            # Clipboard implementation (ext-data-control-v1)
 │   ├── wayland_virtual_keyboard.cpp/.h  # Virtual keyboard protocol
 │   ├── wayland_virtual_pointer.cpp/.h   # Virtual pointer protocol
-│   └── libei_handler.cpp/.h        # LibEI event processing
+│   └── libei_handler.cpp/.h        # libei/libeis event processing
 ├── protocols/
+│   ├── ext-data-control-v1.xml               # Clipboard protocol
 │   ├── virtual-keyboard-unstable-v1.xml      # Wayland keyboard protocol
 │   └── wlr-virtual-pointer-unstable-v1.xml   # wlroots pointer protocol
 ├── data/
-│   ├── hyprland.portal                        # Portal configuration
-│   └── org.freedesktop.impl.portal.desktop.hyprland.service.in
+│   └── hypr-remote.portal                     # Portal interface declaration
+├── contrib/systemd/
+│   └── xdg-desktop-portal-hypr-remote.service.in  # systemd user unit template
+├── org.freedesktop.impl.portal.desktop.hypr-remote.service.in  # D-Bus service template
 ├── shell.nix                       # NixOS development environment
 ├── CMakeLists.txt                  # Build configuration
 ├── build.sh                        # Build script
@@ -87,11 +110,11 @@ hyprland-remote-desktop/
 # Manual testing
 nix-shell
 ./build.sh
-./build/hyprland-remote-desktop
+./build/xdg-desktop-portal-hypr-remote
 
 # D-Bus testing
-busctl --user introspect org.freedesktop.impl.portal.desktop.hyprland.dev /org/freedesktop/portal/desktop
-busctl --user call org.freedesktop.impl.portal.desktop.hyprland.dev /org/freedesktop/portal/desktop org.freedesktop.impl.portal.RemoteDesktop CreateSession 'a{sv}' 0
+busctl --user introspect org.freedesktop.impl.portal.desktop.hypr-remote /org/freedesktop/portal/desktop
+busctl --user call org.freedesktop.impl.portal.desktop.hypr-remote /org/freedesktop/portal/desktop org.freedesktop.impl.portal.RemoteDesktop CreateSession 'a{sv}' 0
 ```
 
 ## 🤝 Contributing
@@ -99,9 +122,9 @@ busctl --user call org.freedesktop.impl.portal.desktop.hyprland.dev /org/freedes
 1. Use the provided `shell.nix` for development
 2. Follow the existing code structure
 3. Test with `./test_portal.sh`
-4. Ensure both keyboard and pointer protocols work
+4. Ensure keyboard, pointer and clipboard all work
 5. Verify D-Bus method signatures match the portal specification
 
 ## 📄 License
 
-MIT License - see LICENSE file for details.
+MIT License.

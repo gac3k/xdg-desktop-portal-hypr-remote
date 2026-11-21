@@ -70,10 +70,30 @@ add_custom_command(
     COMMENT "Generating virtual pointer source"
 )
 
+# ext-data-control protocol (clipboard)
+set(DATA_CONTROL_XML "${PROTOCOL_DIR}/ext-data-control-v1.xml")
+set(DATA_CONTROL_HEADER "${GENERATED_DIR}/ext-data-control-v1-client-protocol.h")
+set(DATA_CONTROL_SOURCE "${GENERATED_DIR}/ext-data-control-v1-protocol.c")
+
+add_custom_command(
+    OUTPUT ${DATA_CONTROL_HEADER}
+    COMMAND ${WAYLAND_SCANNER} client-header ${DATA_CONTROL_XML} ${DATA_CONTROL_HEADER}
+    DEPENDS ${DATA_CONTROL_XML}
+    COMMENT "Generating ext-data-control client header"
+)
+
+add_custom_command(
+    OUTPUT ${DATA_CONTROL_SOURCE}
+    COMMAND ${WAYLAND_SCANNER} private-code ${DATA_CONTROL_XML} ${DATA_CONTROL_SOURCE}
+    DEPENDS ${DATA_CONTROL_XML}
+    COMMENT "Generating ext-data-control source"
+)
+
 # Create a library for protocol sources with C linkage
 add_library(wayland_protocols STATIC
     ${VIRTUAL_KEYBOARD_SOURCE}
     ${VIRTUAL_POINTER_SOURCE}
+    ${DATA_CONTROL_SOURCE}
 )
 
 # Ensure protocol headers are generated before compilation
@@ -82,6 +102,8 @@ add_custom_target(generate_protocols DEPENDS
     ${VIRTUAL_KEYBOARD_SOURCE}
     ${VIRTUAL_POINTER_HEADER}
     ${VIRTUAL_POINTER_SOURCE}
+    ${DATA_CONTROL_HEADER}
+    ${DATA_CONTROL_SOURCE}
 )
 add_dependencies(wayland_protocols generate_protocols)
 
@@ -122,6 +144,7 @@ link_directories(
 add_executable(xdg-desktop-portal-hypr-remote
     src/main.cpp
     src/portal.cpp
+    src/clipboard.cpp
     src/libei_handler.cpp
     src/wayland_virtual_keyboard.cpp
     src/wayland_virtual_pointer.cpp

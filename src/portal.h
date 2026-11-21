@@ -1,20 +1,38 @@
 #pragma once
 
 #include <sdbus-c++/sdbus-c++.h>
+#include <atomic>
+#include <condition_variable>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 extern "C" {
 #include "libei-1.0/libeis.h"
 }
 
 class LibEIHandler;
+class WaylandClipboard;
+
+// Per-connection EIS objects. Lives on the EIS thread's stack (one context serves
+// exactly one client). Each non-null pointer is a ref we own; release_eis_conn()
+// in portal.cpp drops them, devices before the seat.
+struct EisConn {
+    struct eis_client* client = nullptr;   // not a ref; only used to spot a second client
+    struct eis_seat* seat = nullptr;
+    struct eis_device* pointer = nullptr;
+    struct eis_device* keyboard = nullptr;
+};
 
 class Portal {
 public:
     Portal();
     ~Portal();
     
-    bool init(LibEIHandler* handler);
+    // Registers both vtables, then calls clipboard->init() (see clipboard.h, item 9).
+    bool init(LibEIHandler* handler, WaylandClipboard* clipboard);
     void cleanup();
     void run();
     void stop();
@@ -23,8 +41,26 @@ private:
     std::unique_ptr<sdbus::IConnection> connection;
     std::unique_ptr<sdbus::IObject> object;
     LibEIHandler* libei_handler;
-    bool running;
-    
+    WaylandClipboard* clipboard = nullptr;
+
+    // Session table (clipboard.h, item 3). Never call into `clipboard` or emit a
+    // signal while holding sessions_mtx.
+    struct SessionState {
+        bool clipboard_requested = false;
+        bool allowed = false;   // Start accepted this session's app_id
+        std::unique_ptr<sdbus::IObject> obj;   // org.freedesktop.impl.portal.Session
+    };
+    std::mutex sessions_mtx;
+    std::map<std::string, SessionState> sessions;
+    std::vector<std::unique_ptr<sdbus::IObject>> retired;  // closed Session objects
+    std::string clip_session;                              // "" = none
+
+    // EIS server threads (one per ConnectToEIS). cleanup() waits for them.
+    std::atomic<bool> eis_shutdown{false};
+    std::mutex eis_mtx;
+    std::condition_variable eis_cv;
+    int eis_threads = 0;   // guarded by eis_mtx
+
     // Modifier state tracking for proper key combination handling
     uint32_t modifier_state_depressed = 0;
     uint32_t modifier_state_latched = 0;
@@ -43,7 +79,6 @@ private:
     
     // D-Bus method handlers
     void CreateSession(sdbus::MethodCall call);
-    void SelectSources(sdbus::MethodCall call);
     void SelectDevices(sdbus::MethodCall call);
     void Start(sdbus::MethodCall call);
     
@@ -56,6 +91,20 @@ private:
     // Modern EIS (Emulated Input Server) method
     void ConnectToEIS(sdbus::MethodCall call);
     
+    // org.freedesktop.impl.portal.Clipboard
+    void RequestClipboard(sdbus::MethodCall call);
+    void SetSelection(sdbus::MethodCall call);
+    void SelectionWrite(sdbus::MethodCall call);
+    void SelectionWriteDone(sdbus::MethodCall call);
+    void SelectionRead(sdbus::MethodCall call);
+    bool is_clip_session(const std::string& session_handle);
+    void emit_owner_changed(const std::vector<std::string>& mimes);
+    bool emit_transfer(const std::string& mime, uint32_t serial);
+
+    // org.freedesktop.impl.portal.Session at each session_handle
+    void export_session(const sdbus::ObjectPath& session_handle);
+    void SessionClose(sdbus::MethodCall call, const std::string& session_handle);
+
     // EIS event handling
-    void handle_eis_event(struct eis_event* event);
+    void handle_eis_event(struct eis_event* event, EisConn& conn);
 };  

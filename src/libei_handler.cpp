@@ -39,6 +39,7 @@ bool LibEIHandler::init(WaylandVirtualKeyboard* kb, WaylandVirtualPointer* ptr) 
     
     std::cout << "EI receiver context created for portal file descriptor sharing" << std::endl;
     std::cout << "✓ LibEI Handler initialized successfully" << std::endl;
+    running = true;
     return true;
 }
 
@@ -62,7 +63,7 @@ void LibEIHandler::run() {
         return;
     }
     
-    running = true;
+    // running is set in init(), so a stop() issued before this thread gets here sticks.
     std::cout << "LibEI Handler running and processing events..." << std::endl;
     
     int ei_fd = ei_get_fd(ei_context);
@@ -107,6 +108,7 @@ void LibEIHandler::stop() {
 }
 
 void LibEIHandler::handle_event(struct ei_event* event) {
+    std::lock_guard<std::mutex> lock(input_mutex);
     enum ei_event_type type = ei_event_get_type(event);
     
     switch (type) {
@@ -174,7 +176,6 @@ void LibEIHandler::handle_event(struct ei_event* event) {
 
 void LibEIHandler::handle_keyboard_event(struct ei_event* event) {
     if (!keyboard) {
-        std::cout << "EI: Keyboard event received but no virtual keyboard available" << std::endl;
         return;
     }
     
@@ -184,7 +185,6 @@ void LibEIHandler::handle_keyboard_event(struct ei_event* event) {
         uint32_t keycode = ei_event_keyboard_get_key(event);
         bool is_press = ei_event_keyboard_get_key_is_press(event);
         
-        std::cout << "EI: Keyboard " << (is_press ? "press" : "release") << " keycode=" << keycode << std::endl;
         
         // Get current time for wayland events
         uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -197,7 +197,6 @@ void LibEIHandler::handle_keyboard_event(struct ei_event* event) {
 
 void LibEIHandler::handle_pointer_event(struct ei_event* event) {
     if (!pointer) {
-        std::cout << "EI: Pointer event received but no virtual pointer available" << std::endl;
         return;
     }
     
@@ -212,7 +211,6 @@ void LibEIHandler::handle_pointer_event(struct ei_event* event) {
             double dx = ei_event_pointer_get_dx(event);
             double dy = ei_event_pointer_get_dy(event);
             
-            std::cout << "EI: Pointer motion dx=" << dx << " dy=" << dy << std::endl;
             
             // Forward relative motion to virtual pointer
             pointer->send_motion(time, dx, dy);
@@ -224,7 +222,6 @@ void LibEIHandler::handle_pointer_event(struct ei_event* event) {
             double x = ei_event_pointer_get_absolute_x(event);
             double y = ei_event_pointer_get_absolute_y(event);
             
-            std::cout << "EI: Pointer absolute motion x=" << x << " y=" << y << std::endl;
             
             // For absolute motion, we need screen dimensions
             // For now, assume 1920x1080 - this should be dynamically determined
@@ -242,7 +239,6 @@ void LibEIHandler::handle_pointer_event(struct ei_event* event) {
             uint32_t button = ei_event_button_get_button(event);
             bool is_press = ei_event_button_get_is_press(event);
             
-            std::cout << "EI: Button " << (is_press ? "press" : "release") << " button=" << button << std::endl;
             
             // Forward button event to virtual pointer
             pointer->send_button(time, button, is_press ? 1 : 0);
@@ -254,14 +250,13 @@ void LibEIHandler::handle_pointer_event(struct ei_event* event) {
             double dx = ei_event_scroll_get_dx(event);
             double dy = ei_event_scroll_get_dy(event);
             
-            std::cout << "EI: Scroll delta dx=" << dx << " dy=" << dy << std::endl;
             
             // Send scroll events for both axes if non-zero
             if (dx != 0.0) {
-                pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx, dy);
+                pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx);
             }
             if (dy != 0.0) {
-                pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy, dx);
+                pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy);
             }
             pointer->send_frame();
             break;
@@ -271,7 +266,6 @@ void LibEIHandler::handle_pointer_event(struct ei_event* event) {
             int32_t dx = ei_event_scroll_get_discrete_dx(event);
             int32_t dy = ei_event_scroll_get_discrete_dy(event);
             
-            std::cout << "EI: Scroll discrete dx=" << dx << " dy=" << dy << std::endl;
             
             pointer->send_axis_discrete(time, dx, dy);
             pointer->send_frame();

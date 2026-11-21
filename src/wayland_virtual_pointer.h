@@ -17,7 +17,7 @@ public:
     void send_motion(uint32_t time, double dx, double dy);
     void send_motion_absolute(uint32_t time, uint32_t x, uint32_t y, uint32_t x_extent, uint32_t y_extent);
     void send_button(uint32_t time, uint32_t button, uint32_t state);
-    void send_axis(uint32_t time, uint32_t axis, double dx, double dy);
+    void send_axis(uint32_t time, uint32_t axis, double value);
     void send_axis_source(uint32_t axis_source);
     void send_axis_discrete(uint32_t time, int32_t discrete_dx, int32_t discrete_dy);
     void send_axis_stop(uint32_t time, uint32_t axis);

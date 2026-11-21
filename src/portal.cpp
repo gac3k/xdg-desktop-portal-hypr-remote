@@ -1,4 +1,6 @@
+#include <atomic>
 #include "portal.h"
+#include "clipboard.h"
 #include "libei_handler.h"
 #include "wayland_virtual_keyboard.h"
 #include "wayland_virtual_pointer.h"
@@ -8,13 +10,9 @@
 #include <cstring>
 #include <cerrno>
 #include <unistd.h>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/un.h>
 #include <poll.h>
 #include <algorithm>
 #include <sys/mman.h>
-#include <fcntl.h>
 
 extern "C" {
 #include <libei.h>
@@ -22,31 +20,207 @@ extern "C" {
 #include <wayland-client-protocol.h>
 }
 
+// ---- Monitor layout (hypr-remote local patch) ----------------------------
+// Synergy/Deskflow sends absolute positions within one rectangle. Hyprland
+// maps virtual-pointer absolute motion onto the bounding box of all monitors
+// without keeping it on a monitor, so the cursor could enter the dead space
+// of a non-rectangular layout. We advertise the real bounding box and clamp
+// every absolute position onto the nearest monitor.
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <vector>
+#include <mutex>
+
+namespace {
+struct LayoutRect { double x, y, w, h; };
+struct Layout {
+    std::vector<LayoutRect> monitors;
+    double min_x = 0, min_y = 0, width = 1920, height = 1080;
+};
+
+Layout parse_hyprctl_monitors() {
+    Layout layout;
+    FILE* pipe = popen("hyprctl monitors 2>/dev/null", "re");
+    if (!pipe) return layout;
+    std::vector<LayoutRect> rects;
+    char line[512];
+    int pw = 0, ph = 0, px = 0, py = 0, transform = 0;
+    double scale = 1.0;
+    bool have_mode = false;
+    auto flush = [&]() {
+        if (!have_mode) return;
+        double w = pw / (scale > 0 ? scale : 1.0);
+        double h = ph / (scale > 0 ? scale : 1.0);
+        if (transform % 2 == 1) std::swap(w, h);
+        rects.push_back({double(px), double(py), std::round(w), std::round(h)});
+        have_mode = false; scale = 1.0; transform = 0;
+    };
+    while (fgets(line, sizeof line, pipe)) {
+        if (strncmp(line, "Monitor ", 8) == 0) { flush(); continue; }
+        double hz; int a, b, c, d;
+        if (sscanf(line, " %dx%d@%lf at %dx%d", &a, &b, &hz, &c, &d) == 5) {
+            pw = a; ph = b; px = c; py = d; have_mode = true;
+        } else if (sscanf(line, " scale: %lf", &hz) == 1) {
+            scale = hz;
+        } else if (sscanf(line, " transform: %d", &a) == 1) {
+            transform = a;
+        }
+    }
+    flush();
+    pclose(pipe);
+    if (rects.empty()) return layout;
+    double x0 = rects[0].x, y0 = rects[0].y, x1 = x0, y1 = y0;
+    for (auto& r : rects) {
+        x0 = std::min(x0, r.x); y0 = std::min(y0, r.y);
+        x1 = std::max(x1, r.x + r.w); y1 = std::max(y1, r.y + r.h);
+    }
+    layout.monitors = rects;
+    layout.min_x = x0; layout.min_y = y0;
+    layout.width = x1 - x0; layout.height = y1 - y0;
+    return layout;
+}
+
+std::mutex g_layout_mutex;
+Layout g_layout;
+// Monitor the cursor is currently on (index into layout.monitors), -1 = unknown.
+// Positions that fall in dead space are clamped onto this monitor, so the
+// cursor slides along its edge instead of jumping to whichever monitor is nearest.
+int g_current_monitor = -1;
+Layout current_layout(bool force = false) {
+    std::lock_guard<std::mutex> lock(g_layout_mutex);
+    if (force || g_layout.monitors.empty()) {
+        Layout fresh = parse_hyprctl_monitors();
+        if (!fresh.monitors.empty()) g_layout = fresh;
+    }
+    return g_layout;
+}
+
+// x, y are relative to the bounding box origin. If the point is on a monitor it is
+// kept as-is; otherwise it is clamped onto the current monitor (or the nearest
+// one if the current monitor is unknown).
+void clamp_to_monitors(const Layout& layout, double& x, double& y) {
+    if (layout.monitors.empty()) return;
+    double lx = x + layout.min_x, ly = y + layout.min_y;
+    for (size_t i = 0; i < layout.monitors.size(); ++i) {
+        auto& r = layout.monitors[i];
+        if (lx >= r.x && lx < r.x + r.w && ly >= r.y && ly < r.y + r.h) {
+            g_current_monitor = static_cast<int>(i);
+            return;
+        }
+    }
+    if (g_current_monitor >= 0 && g_current_monitor < static_cast<int>(layout.monitors.size())) {
+        auto& r = layout.monitors[g_current_monitor];
+        x = std::clamp(lx, r.x, r.x + r.w - 1) - layout.min_x;
+        y = std::clamp(ly, r.y, r.y + r.h - 1) - layout.min_y;
+        return;
+    }
+    double best_x = lx, best_y = ly, best_d = -1;
+    for (auto& r : layout.monitors) {
+        double cx = std::clamp(lx, r.x, r.x + r.w - 1);
+        double cy = std::clamp(ly, r.y, r.y + r.h - 1);
+        double d = (cx - lx) * (cx - lx) + (cy - ly) * (cy - ly);
+        if (best_d < 0 || d < best_d) { best_d = d; best_x = cx; best_y = cy; g_current_monitor = static_cast<int>(&r - &layout.monitors[0]); }
+    }
+    x = best_x - layout.min_x;
+    y = best_y - layout.min_y;
+}
+
+// Turns Synergy's absolute positions into a cursor position that never
+// overshoots into dead space. The cursor follows Synergy's *movement*, scaled
+// per axis so that the cursor reaches a layout edge exactly when Synergy's
+// position reaches the matching edge of its rectangle. Any gap left by pushing
+// against a wall therefore shrinks smoothly, and Synergy hitting the edge of its
+// rectangle never stops the cursor short of the real screen edge.
+struct AbsTracker {
+    bool have_prev = false;
+    double raw_x = 0, raw_y = 0;   // last position Synergy sent
+    double real_x = 0, real_y = 0; // last position we sent to Hyprland
+};
+AbsTracker g_abs;
+
+double follow_axis(double raw_prev, double raw_new, double real_prev, double extent) {
+    double d = raw_new - raw_prev;
+    if (d == 0) return real_prev;
+    double hi = extent - 1;
+    double raw_room = d < 0 ? raw_prev : hi - raw_prev;   // distance to Synergy's bound
+    double real_room = d < 0 ? real_prev : hi - real_prev; // distance to layout bound
+    double factor = raw_room > 0.5 ? real_room / raw_room : 12.0;
+    factor = std::clamp(factor, 0.25, 12.0);
+    double out = real_prev + d * factor;
+    if ((d < 0 && raw_new <= 0) || (d > 0 && raw_new >= hi)) out = d < 0 ? 0 : hi;
+    return std::clamp(out, 0.0, hi);
+}
+
+void track_absolute(const Layout& layout, double& x, double& y) {
+    double rx = x, ry = y;
+    double dx = rx - g_abs.raw_x, dy = ry - g_abs.raw_y;
+    if (!g_abs.have_prev || std::abs(dx) > 400 || std::abs(dy) > 400) {
+        // Entry point or jump: go where Synergy says, onto the nearest monitor.
+        g_current_monitor = -1;
+    } else {
+        x = follow_axis(g_abs.raw_x, rx, g_abs.real_x, layout.width);
+        y = follow_axis(g_abs.raw_y, ry, g_abs.real_y, layout.height);
+    }
+    clamp_to_monitors(layout, x, y);
+    g_abs = {true, rx, ry, x, y};
+}
+} // namespace
+
 static const char* PORTAL_INTERFACE = "org.freedesktop.impl.portal.RemoteDesktop";
 static const char* PORTAL_PATH = "/org/freedesktop/portal/desktop";
+static const char* CLIPBOARD_INTERFACE = "org.freedesktop.impl.portal.Clipboard";
+static const char* SESSION_INTERFACE = "org.freedesktop.impl.portal.Session";
+static const char* PORTAL_ERROR_FAILED = "org.freedesktop.portal.Error.Failed";
+
+static void reply_failed(sdbus::MethodCall& call, const std::string& message) {
+    call.createErrorReply(sdbus::Error(sdbus::Error::Name{PORTAL_ERROR_FAILED}, message)).send();
+}
+
+// HYPR_REMOTE_ALLOWED_APP_IDS: comma-separated app IDs allowed to Start a session.
+// Unset: only "" (host apps). An empty item means host apps; "*" allows all.
+static bool app_id_allowed(const std::string& app_id) {
+    static const std::vector<std::string> allowed = [] {
+        std::vector<std::string> out;
+        const char* env = std::getenv("HYPR_REMOTE_ALLOWED_APP_IDS");
+        std::string s = env ? env : "";
+        size_t start = 0;
+        while (true) {
+            size_t comma = s.find(',', start);
+            out.push_back(s.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+            if (comma == std::string::npos) break;
+            start = comma + 1;
+        }
+        return out;
+    }();
+    for (const auto& a : allowed)
+        if (a == "*" || a == app_id) return true;
+    return false;
+}
 
 // Use development name if requested, otherwise use standard name
 static const char* PORTAL_NAME = "org.freedesktop.impl.portal.desktop.hypr-remote";
 
-Portal::Portal() : libei_handler(nullptr), running(false) {
+Portal::Portal() : libei_handler(nullptr) {
 }
 
 Portal::~Portal() {
     cleanup();
 }
 
-bool Portal::init(LibEIHandler* handler) {
+bool Portal::init(LibEIHandler* handler, WaylandClipboard* clip) {
     libei_handler = handler;
+    clipboard = clip;
     
     try {
         // Create D-Bus connection to SESSION bus (not system bus)
         connection = sdbus::createSessionBusConnection();
         
         // Request the portal name
-        connection->requestName(PORTAL_NAME);
+        connection->requestName(sdbus::ServiceName{PORTAL_NAME});
         
         // Create the portal object
-        object = sdbus::createObject(*connection, PORTAL_PATH);
+        object = sdbus::createObject(*connection, sdbus::ObjectPath{PORTAL_PATH});
         std::cout << "Portal D-Bus interface registered at " << PORTAL_NAME << std::endl;
         std::cout << "Portal registered on SESSION bus (not system bus)" << std::endl;
         std::cout << "Portal version: 2" << std::endl;
@@ -54,53 +228,74 @@ bool Portal::init(LibEIHandler* handler) {
         std::cout << "Portal interface: " << PORTAL_INTERFACE << std::endl;
 
         // Register RemoteDesktop interface methods with correct signatures
-        object->registerMethod(PORTAL_INTERFACE, "CreateSession", "oosa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { CreateSession(std::move(call)); });
-        
-        /* object->registerMethod(PORTAL_INTERFACE, "SelectSources", "oosa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { SelectSources(std::move(call)); }); */
-        
-        object->registerMethod(PORTAL_INTERFACE, "SelectDevices", "oosa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { SelectDevices(std::move(call)); });
-        
-        object->registerMethod(PORTAL_INTERFACE, "Start", "oossa{sv}", "ua{sv}", 
-                              [this](sdbus::MethodCall call) { Start(std::move(call)); });
-        
-        // Add the input notification methods that clients call to send input events
-        object->registerMethod(PORTAL_INTERFACE, "NotifyPointerMotion", "oa{sv}dd", "", 
-                              [this](sdbus::MethodCall call) { NotifyPointerMotion(std::move(call)); });
-        
-        object->registerMethod(PORTAL_INTERFACE, "NotifyPointerButton", "oa{sv}iu", "", 
-                              [this](sdbus::MethodCall call) { NotifyPointerButton(std::move(call)); });
-        
-        object->registerMethod(PORTAL_INTERFACE, "NotifyKeyboardKeycode", "oa{sv}iu", "", 
-                              [this](sdbus::MethodCall call) { NotifyKeyboardKeycode(std::move(call)); });
-        
-        object->registerMethod(PORTAL_INTERFACE, "NotifyPointerAxis", "oa{sv}dd", "", 
-                              [this](sdbus::MethodCall call) { NotifyPointerAxis(std::move(call)); });
-        
-        // Modern EIS (Emulated Input Server) method - this is what deskflow actually uses!
-        object->registerMethod(PORTAL_INTERFACE, "ConnectToEIS", "osa{sv}", "h", 
-                              [this](sdbus::MethodCall call) { ConnectToEIS(std::move(call)); });
-        object->registerProperty(PORTAL_INTERFACE, "version", "u", [](sdbus::PropertyGetReply& reply) -> void { reply << (uint)2; });
         // Finalize the object
-        object->finishRegistration();
-        
-        std::cout << "Portal D-Bus interface registered at " << PORTAL_NAME << std::endl;
-        std::cout << "Portal registered on SESSION bus (not system bus)" << std::endl;
-        return true;
-        
+        object->addVTable(
+            sdbus::MethodVTableItem{sdbus::MethodName{"CreateSession"}, sdbus::Signature{"oosa{sv}"}, {}, sdbus::Signature{"ua{sv}"}, {}, [this](sdbus::MethodCall call) { CreateSession(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SelectDevices"}, sdbus::Signature{"oosa{sv}"}, {}, sdbus::Signature{"ua{sv}"}, {}, [this](sdbus::MethodCall call) { SelectDevices(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"Start"}, sdbus::Signature{"oossa{sv}"}, {}, sdbus::Signature{"ua{sv}"}, {}, [this](sdbus::MethodCall call) { Start(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"NotifyPointerMotion"}, sdbus::Signature{"oa{sv}dd"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { NotifyPointerMotion(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"NotifyPointerButton"}, sdbus::Signature{"oa{sv}iu"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { NotifyPointerButton(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"NotifyKeyboardKeycode"}, sdbus::Signature{"oa{sv}iu"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { NotifyKeyboardKeycode(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"NotifyPointerAxis"}, sdbus::Signature{"oa{sv}dd"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { NotifyPointerAxis(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"ConnectToEIS"}, sdbus::Signature{"osa{sv}"}, {}, sdbus::Signature{"h"}, {}, [this](sdbus::MethodCall call) { ConnectToEIS(std::move(call)); }, {}},
+            sdbus::PropertyVTableItem{sdbus::PropertyName{"version"}, sdbus::Signature{"u"}, [](sdbus::PropertyGetReply& reply) { reply << (uint32_t)2; }, {}, {}}
+        ).forInterface(sdbus::InterfaceName{PORTAL_INTERFACE});
+
+        // Clipboard interface (always exported; methods fail if data-control is missing)
+        object->addVTable(
+            sdbus::MethodVTableItem{sdbus::MethodName{"RequestClipboard"}, sdbus::Signature{"oa{sv}"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { RequestClipboard(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SetSelection"}, sdbus::Signature{"oa{sv}"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { SetSelection(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SelectionWrite"}, sdbus::Signature{"ou"}, {}, sdbus::Signature{"h"}, {}, [this](sdbus::MethodCall call) { SelectionWrite(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SelectionWriteDone"}, sdbus::Signature{"oub"}, {}, sdbus::Signature{""}, {}, [this](sdbus::MethodCall call) { SelectionWriteDone(std::move(call)); }, {}},
+            sdbus::MethodVTableItem{sdbus::MethodName{"SelectionRead"}, sdbus::Signature{"os"}, {}, sdbus::Signature{"h"}, {}, [this](sdbus::MethodCall call) { SelectionRead(std::move(call)); }, {}},
+            sdbus::SignalVTableItem{sdbus::SignalName{"SelectionOwnerChanged"}, sdbus::Signature{"oa{sv}"}, {}, {}},
+            sdbus::SignalVTableItem{sdbus::SignalName{"SelectionTransfer"}, sdbus::Signature{"osu"}, {}, {}},
+            sdbus::PropertyVTableItem{sdbus::PropertyName{"version"}, sdbus::Signature{"u"}, [](sdbus::PropertyGetReply& reply) { reply << (uint32_t)1; }, {}, {}}
+        ).forInterface(sdbus::InterfaceName{CLIPBOARD_INTERFACE});
     } catch (const sdbus::Error& e) {
         std::cerr << "Failed to initialize D-Bus portal: " << e.what() << std::endl;
         std::cerr << "This is normal if another portal is already running or if running outside a desktop session." << std::endl;
         cleanup();
         return false;
     }
+
+    // Clipboard failures never stop mouse and keyboard (clipboard.h, items 8-9).
+    if (clipboard) {
+        ClipboardCallbacks callbacks;
+        callbacks.owner_changed = [this](const std::vector<std::string>& mimes) { emit_owner_changed(mimes); };
+        callbacks.transfer_requested = [this](const std::string& mime, uint32_t serial) { return emit_transfer(mime, serial); };
+        if (!clipboard->init(std::move(callbacks)))
+            std::cerr << "clipboard: disabled; remote input still works" << std::endl;
+    }
+    return true;
 }
 
 void Portal::cleanup() {
-    running = false;
-    
+    // EIS server threads capture `this` and drive the virtual devices, so wait
+    // for them before anything is torn down. Idempotent: ~Portal calls this
+    // again, when the count is already 0.
+    eis_shutdown = true;
+    {
+        std::unique_lock<std::mutex> lk(eis_mtx);
+        if (!eis_cv.wait_for(lk, std::chrono::seconds(3), [this] { return eis_threads == 0; }))
+            std::cerr << eis_threads << " EIS thread(s) still running at shutdown" << std::endl;
+    }
+
+    // Session objects must go before the connection. The clipboard thread has
+    // been stopped by now (main stops it before cleanup()). Destroy them outside
+    // sessions_mtx: destroying an object takes the sdbus lock, and method
+    // handlers run under that lock and take sessions_mtx (lock order).
+    std::map<std::string, SessionState> closing;
+    std::vector<std::unique_ptr<sdbus::IObject>> closing_retired;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        closing.swap(sessions);
+        closing_retired.swap(retired);
+        clip_session.clear();
+    }
+    closing.clear();
+    closing_retired.clear();
+
     if (object) {
         object.reset();
     }
@@ -112,8 +307,6 @@ void Portal::cleanup() {
 
 void Portal::run() {
     if (!connection) return;
-    
-    running = true;
     
     std::cout << "🔄 Starting proper sdbus D-Bus event loop..." << std::endl;
     std::cout << "📡 Portal ready to receive D-Bus calls!" << std::endl;
@@ -130,7 +323,8 @@ void Portal::run() {
 }
 
 void Portal::stop() {
-    running = false;
+    // EIS server threads see this within 100 ms; cleanup() waits for them.
+    eis_shutdown = true;
     // Exit the sdbus event loop cleanly
     if (connection) {
         connection->leaveEventLoop();
@@ -167,6 +361,8 @@ void Portal::CreateSession(sdbus::MethodCall call) {
         return;
     }
     
+    export_session(session_handle);
+
     // Create session response
     std::map<std::string, sdbus::Variant> response;
     response["session_handle"] = sdbus::Variant(session_handle);
@@ -178,32 +374,6 @@ void Portal::CreateSession(sdbus::MethodCall call) {
     
     std::cout << "✅ CreateSession completed successfully" << std::endl;
     std::cout << "📋 NEXT: Client should call SelectDevices or Start" << std::endl;
-}
-
-void Portal::SelectSources(sdbus::MethodCall call) {
-    std::cout << "🔥 RemoteDesktop SelectSources called!" << std::endl;
-    
-    // Extract parameters
-    sdbus::ObjectPath session_handle;
-    std::map<std::string, sdbus::Variant> options;
-    call >> session_handle >> options;
-    
-    std::cout << "Session handle: " << session_handle << std::endl;
-    std::cout << "Options received:" << std::endl;
-    for (const auto& option : options) {
-        std::cout << "  " << option.first << std::endl;
-    }
-    
-    // Response - allow all sources
-    std::map<std::string, sdbus::Variant> response;
-    response["types"] = sdbus::Variant(static_cast<uint32_t>(7)); // keyboard | pointer | touchscreen
-    
-    auto reply = call.createReply();
-    reply << static_cast<uint32_t>(0); // Success
-    reply << response;
-    reply.send();
-    
-    std::cout << "✅ SelectSources completed for session: " << session_handle << std::endl;
 }
 
 void Portal::SelectDevices(sdbus::MethodCall call) {
@@ -290,16 +460,52 @@ void Portal::Start(sdbus::MethodCall call) {
         return;
     }
     
+    if (!app_id_allowed(app_id)) {
+        std::cout << "Start: denied for app_id '" << app_id
+                  << "' (not in HYPR_REMOTE_ALLOWED_APP_IDS)" << std::endl;
+        auto reply = call.createReply();
+        reply << static_cast<uint32_t>(2); // Other
+        reply << std::map<std::string, sdbus::Variant>{};
+        reply.send();
+        return;
+    }
+
     std::cout << "✅ Using existing LibEI handler for input processing" << std::endl;
     
     // Start the remote desktop session
     std::map<std::string, sdbus::Variant> response;
     response["devices"] = sdbus::Variant(static_cast<uint32_t>(7)); // keyboard | pointer | touchscreen
+
+    // Ask the clipboard before taking sessions_mtx (see portal.h).
+    bool clipboard_enabled = clipboard && clipboard->available();
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        auto& state = sessions[session_handle];
+        clipboard_enabled = clipboard_enabled && state.clipboard_requested;
+        state.allowed = true;
+    }
+    if (clipboard_enabled) response["clipboard_enabled"] = sdbus::Variant(true);
+    std::cout << "Start: clipboard_enabled=" << (clipboard_enabled ? "true" : "false") << std::endl;
     
     auto reply = call.createReply();
     reply << static_cast<uint32_t>(0); // Success
     reply << response;
     reply.send();
+
+    if (clipboard_enabled) {
+        std::string previous;
+        {
+            std::lock_guard<std::mutex> lock(sessions_mtx);
+            previous = clip_session;
+            clip_session = session_handle;
+        }
+        if (!previous.empty() && previous != std::string(session_handle)) {
+            std::cout << "clipboard: session " << previous << " replaced by "
+                      << session_handle << std::endl;
+            clipboard->session_ended();  // before announce(): commands run in FIFO order
+        }
+        clipboard->announce();
+    }
     
     std::cout << "Start completed - remote desktop session active for session: " << session_handle << std::endl;
     std::cout << "LibEI handler ready for input processing" << std::endl;
@@ -307,9 +513,6 @@ void Portal::Start(sdbus::MethodCall call) {
 }
 
 void Portal::NotifyPointerMotion(sdbus::MethodCall call) {
-    std::cout << "🖱️ NotifyPointerMotion called!" << std::endl;
-    std::cout << "📋 FLOW: Step 4/4 - Input events (Mouse Motion)" << std::endl;
-    std::cout << "🎯 DESKFLOW IS USING LEGACY NOTIFY METHODS!" << std::endl;
     
     // Extract parameters
     sdbus::ObjectPath session_handle;
@@ -317,27 +520,25 @@ void Portal::NotifyPointerMotion(sdbus::MethodCall call) {
     double dx, dy;
     call >> session_handle >> options >> dx >> dy;
     
-    std::cout << "Session: " << session_handle << ", Motion: dx=" << dx << ", dy=" << dy << std::endl;
     
     // Get current time for wayland events
     uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual pointer via libei handler's virtual pointer
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->pointer) {
         libei_handler->pointer->send_motion(time, dx, dy);
         libei_handler->pointer->send_frame();
-        std::cout << "✅ Motion forwarded to virtual pointer" << std::endl;
-    } else {
-        std::cout << "❌ No virtual pointer available" << std::endl;
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
 
 void Portal::NotifyPointerButton(sdbus::MethodCall call) {
-    std::cout << "🖱️ NotifyPointerButton called!" << std::endl;
     
     // Extract parameters
     sdbus::ObjectPath session_handle;
@@ -346,27 +547,25 @@ void Portal::NotifyPointerButton(sdbus::MethodCall call) {
     uint32_t state;
     call >> session_handle >> options >> button >> state;
     
-    std::cout << "Session: " << session_handle << ", Button: " << button << ", State: " << state << std::endl;
     
     // Get current time for wayland events
     uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual pointer
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->pointer) {
         libei_handler->pointer->send_button(time, static_cast<uint32_t>(button), state);
         libei_handler->pointer->send_frame();
-        std::cout << "✅ Button event forwarded to virtual pointer" << std::endl;
-    } else {
-        std::cout << "❌ No virtual pointer available" << std::endl;
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
 
 void Portal::NotifyKeyboardKeycode(sdbus::MethodCall call) {
-    std::cout << "⌨️ NotifyKeyboardKeycode called!" << std::endl;
     
     // Extract parameters
     sdbus::ObjectPath session_handle;
@@ -375,26 +574,24 @@ void Portal::NotifyKeyboardKeycode(sdbus::MethodCall call) {
     uint32_t state;
     call >> session_handle >> options >> keycode >> state;
     
-    std::cout << "Session: " << session_handle << ", Keycode: " << keycode << ", State: " << state << std::endl;
     
     // Get current time for wayland events
     uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual keyboard
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->keyboard) {
         libei_handler->keyboard->send_key(time, static_cast<uint32_t>(keycode), state);
-        std::cout << "✅ Key event forwarded to virtual keyboard" << std::endl;
-    } else {
-        std::cout << "❌ No virtual keyboard available" << std::endl;
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
 }
 
 void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
-    std::cout << "🖱️ NotifyPointerAxis called!" << std::endl;
     
     // Extract parameters
     sdbus::ObjectPath session_handle;
@@ -402,34 +599,57 @@ void Portal::NotifyPointerAxis(sdbus::MethodCall call) {
     double dx, dy;
     call >> session_handle >> options >> dx >> dy;
     
-    std::cout << "Session: " << session_handle << ", Axis: dx=" << dx << ", dy=" << dy << std::endl;
     
     // Get current time for wayland events
     uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
     
     // Forward to virtual pointer with proper Wayland scroll protocol
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     if (libei_handler && libei_handler->pointer) {
         // Set axis source for legacy scroll events
         libei_handler->pointer->send_axis_source(WL_POINTER_AXIS_SOURCE_WHEEL);
         
         // Send scroll events for both axes if non-zero
         if (dx != 0.0) {
-            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx, dy);
+            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx);
             libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
         }
         if (dy != 0.0) {
-            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dx, dy);
+            libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy);
             libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_VERTICAL_SCROLL);
         }
         libei_handler->pointer->send_frame();
-        std::cout << "✅ Legacy axis event forwarded with proper scroll protocol" << std::endl;
-    } else {
-        std::cout << "❌ No virtual pointer available" << std::endl;
     }
     
+    if (input_lock.owns_lock()) input_lock.unlock();
     auto reply = call.createReply();
     reply.send();
+}
+
+// Drop one of our EIS devices (libei 1.6.0, checked against the source):
+// eis_device_remove takes the device off seat->devices and drops libeis's own ref.
+// It is a no-op on a device that eis_seat_drop already removed (state DEAD), and
+// it must run before the seat goes, or eis_seat_destroy asserts "device list not
+// empty". Our unref then frees the device and, with it, its region and keymap
+// (the keymap's memfd dup).
+static void release_eis_device(struct eis_device*& device) {
+    if (!device) return;
+    eis_device_remove(device);
+    eis_device_unref(device);
+    device = nullptr;
+}
+
+// Release everything in `conn`, devices first and the seat last. Safe to call
+// more than once. Callers hold input_mutex, as handle_eis_event does.
+static void release_eis_conn(EisConn& conn) {
+    release_eis_device(conn.pointer);
+    release_eis_device(conn.keyboard);
+    if (conn.seat) {
+        eis_seat_unref(conn.seat);
+        conn.seat = nullptr;
+    }
 }
 
 void Portal::ConnectToEIS(sdbus::MethodCall call) {
@@ -453,218 +673,157 @@ void Portal::ConnectToEIS(sdbus::MethodCall call) {
         }
     } catch (const std::exception& e) {
         std::cerr << "Error extracting ConnectToEIS parameters: " << e.what() << std::endl;
-        call.createErrorReply(sdbus::Error("org.freedesktop.portal.Error.Failed", "Failed to extract parameters")).send();
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Failed to extract parameters")).send();
         return;
     }
     
     if (!libei_handler || !libei_handler->keyboard || !libei_handler->pointer) {
         std::cerr << "Virtual devices not available" << std::endl;
-        call.createErrorReply(sdbus::Error("org.freedesktop.portal.Error.Failed", "Virtual devices not available")).send();
+        call.createErrorReply(sdbus::Error(sdbus::Error::Name{"org.freedesktop.portal.Error.Failed"}, "Virtual devices not available")).send();
         return;
     }
     
-    // Create a socket pair - one end for deskflow, one end for our EIS server
-    int socket_pair[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM, 0, socket_pair) == -1) {
-        std::cerr << "Error creating socket pair: " << strerror(errno) << std::endl;
-        call.createErrorReply(sdbus::Error("org.freedesktop.portal.Error.Failed", "Failed to create socket pair")).send();
+    bool allowed = false;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        auto it = sessions.find(session_handle);
+        allowed = it != sessions.end() && it->second.allowed;
+    }
+    if (!allowed) {
+        std::cout << "ConnectToEIS: refused, session not started" << std::endl;
+        reply_failed(call, "Session not started");
         return;
     }
-    
-    int client_fd = socket_pair[0];  // This goes to deskflow
-    int server_fd = socket_pair[1];  // This stays with us for EIS server
-    
-    std::cout << "✅ Created socket pair - client_fd: " << client_fd << ", server_fd: " << server_fd << std::endl;
-    
-    // Start a thread to run a proper EIS server
-    std::thread([this, server_fd]() {
-        std::cout << "📡 Starting proper EIS server thread..." << std::endl;
-        
-        // Create EIS server context (similar to hyprland-eis)
-        struct eis* eis_context = eis_new(nullptr);
-        if (!eis_context) {
-            std::cerr << "Failed to create EIS server context" << std::endl;
-            close(server_fd);
-            return;
-        }
-        
-        // Set up logging (optional, for debugging)
-        // eis_log_set_priority(eis_context, EIS_LOG_PRIORITY_DEBUG);
-        
-        std::cout << "✅ EIS server context created" << std::endl;
-        
-        // Create a temporary socket and immediately connect our FD to it
-        // This is a workaround since libeis may not support direct FD setup
-        
-        // Alternative approach: Create a proper EIS server socket and handle the connection
-        char socket_path[256];
-        snprintf(socket_path, sizeof(socket_path), "/tmp/hypr-portal-eis-%d", getpid());
-        
-        // Setup EIS backend with temporary socket
-        int rc = eis_setup_backend_socket(eis_context, socket_path);
-        if (rc != 0) {
-            std::cerr << "Failed to setup EIS backend socket: " << strerror(errno) << std::endl;
-            eis_unref(eis_context);
-            close(server_fd);
-            return;
-        }
-        
-        std::cout << "✅ EIS backend socket created at: " << socket_path << std::endl;
-        
-        // Now we need to bridge between our socket_pair and the EIS socket
-        // Start a bridge thread to forward data between them
-        std::thread bridge_thread([server_fd, socket_path]() {
-            std::cout << "🌉 Starting socket bridge..." << std::endl;
-            
-            // Connect to the EIS socket
-            int eis_sock = socket(AF_UNIX, SOCK_STREAM, 0);
-            if (eis_sock == -1) {
-                std::cerr << "Failed to create bridge socket" << std::endl;
-                return;
-            }
-            
-            struct sockaddr_un addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sun_family = AF_UNIX;
-            strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
-            
-            // Wait a bit for the EIS server to start
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            
-            if (connect(eis_sock, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
-                std::cerr << "Failed to connect to EIS socket: " << strerror(errno) << std::endl;
-                close(eis_sock);
-                return;
-            }
-            
-            std::cout << "✅ Bridge connected to EIS socket" << std::endl;
-            
-            // Bridge data bidirectionally between server_fd and eis_sock
-            fd_set read_fds;
-            char buffer[4096];
-            
-            // Make sockets non-blocking for better performance
-            int flags = fcntl(server_fd, F_GETFL, 0);
-            fcntl(server_fd, F_SETFL, flags | O_NONBLOCK);
-            flags = fcntl(eis_sock, F_GETFL, 0);
-            fcntl(eis_sock, F_SETFL, flags | O_NONBLOCK);
-            
-            while (true) {
-                FD_ZERO(&read_fds);
-                FD_SET(server_fd, &read_fds);
-                FD_SET(eis_sock, &read_fds);
-                
-                int max_fd = std::max(server_fd, eis_sock);
-                struct timeval timeout = {0, 100000}; // 100ms timeout for better responsiveness
-                
-                int activity = select(max_fd + 1, &read_fds, nullptr, nullptr, &timeout);
-                
-                if (activity < 0) {
-                    std::cerr << "Bridge select error: " << strerror(errno) << std::endl;
+
+    if (eis_shutdown.load()) {
+        reply_failed(call, "Shutting down");
+        return;
+    }
+
+    // libeis fd backend: libeis makes a socket pair and keeps one end; the other
+    // goes to deskflow. No socket file and no relay thread (CLIPBOARD-PLAN.md §3.2, S3).
+    struct eis* eis_context = eis_new(nullptr);
+    if (!eis_context || eis_setup_backend_fd(eis_context) != 0) {
+        std::cerr << "Failed to set up EIS fd backend" << std::endl;
+        if (eis_context) eis_unref(eis_context);
+        reply_failed(call, "Failed to set up EIS");
+        return;
+    }
+
+    int client_fd = eis_backend_fd_add_client(eis_context);
+    if (client_fd < 0) {
+        std::cerr << "Failed to add EIS client fd: " << strerror(-client_fd) << std::endl;
+        eis_unref(eis_context);
+        reply_failed(call, "Failed to set up EIS");
+        return;
+    }
+
+    // Count the thread before it exists, so that cleanup() can't miss it.
+    {
+        std::lock_guard<std::mutex> lock(eis_mtx);
+        ++eis_threads;
+    }
+
+    // From here on only the new thread touches eis_context.
+    try {
+        std::thread([this, eis_context]() {
+            // Declared first so that it runs last: after this, the thread no longer
+            // touches `this`.
+            struct Guard {
+                Portal* p;
+                ~Guard() {
+                    std::lock_guard<std::mutex> l(p->eis_mtx);
+                    --p->eis_threads;
+                    p->eis_cv.notify_all();
+                }
+            } guard{this};
+
+            std::cout << "🚀 Starting EIS server event loop..." << std::endl;
+
+            EisConn conn;   // our seat and device refs for this client
+            bool stop = false;
+            // libeis reports nothing if the fd is closed before the client ever
+            // connects, so give up on our own after a while.
+            bool connected = false;
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            struct pollfd fds = {
+                .fd = eis_get_fd(eis_context),
+                .events = POLLIN,
+                .revents = 0,
+            };
+
+            while (!stop && !eis_shutdown.load()) {
+                if (!connected && std::chrono::steady_clock::now() >= deadline) {
+                    std::cout << "EIS: client never connected; stopping" << std::endl;
                     break;
                 }
-                
-                if (activity == 0) continue; // timeout
-                
-                // Forward data from deskflow (server_fd) to EIS server (eis_sock)
-                if (FD_ISSET(server_fd, &read_fds)) {
-                    ssize_t bytes = read(server_fd, buffer, sizeof(buffer));
-                    if (bytes <= 0) {
-                        if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                            std::cout << "Deskflow disconnected from bridge" << std::endl;
-                            break;
-                        }
-                    } else {
-                        if (write(eis_sock, buffer, bytes) != bytes) {
-                            std::cerr << "Failed to forward data to EIS server" << std::endl;
-                            break;
-                        }
-                        //std::cout << "🔄 Forwarded " << bytes << " bytes from deskflow to EIS" << std::endl;
-                    }
+
+                int nevents = poll(&fds, 1, 100); // 100 ms, so that shutdown and the deadline are seen
+                if (nevents == -1) {
+                    if (errno == EINTR) continue;
+                    std::cerr << "EIS poll error: " << strerror(errno) << std::endl;
+                    break;
                 }
-                
-                // Forward data from EIS server (eis_sock) to deskflow (server_fd)
-                if (FD_ISSET(eis_sock, &read_fds)) {
-                    ssize_t bytes = read(eis_sock, buffer, sizeof(buffer));
-                    if (bytes <= 0) {
-                        if (bytes == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
-                            std::cout << "EIS server disconnected from bridge" << std::endl;
-                            break;
-                        }
-                    } else {
-                        if (write(server_fd, buffer, bytes) != bytes) {
-                            std::cerr << "Failed to forward data to deskflow" << std::endl;
-                            break;
-                        }
-                        //std::cout << "🔄 Forwarded " << bytes << " bytes from EIS to deskflow" << std::endl;
-                    }
+
+                if (nevents == 0) continue; // timeout
+
+                // Process all pending EIS events in one go - this is crucial for scroll
+                eis_dispatch(eis_context);
+
+                // Handle ALL events in the queue immediately
+                struct eis_event* event;
+                while ((event = eis_get_event(eis_context)) != nullptr) {
+
+                    // Handle EIS events and forward to virtual devices
+                    enum eis_event_type type = eis_event_get_type(event);
+                    if (type == EIS_EVENT_CLIENT_CONNECT) connected = true;
+                    bool client_gone = type == EIS_EVENT_CLIENT_DISCONNECT;
+                    handle_eis_event(event, conn);
+                    eis_event_unref(event);
+                    if (client_gone) stop = true;
                 }
             }
-            
-            std::cout << "🌉 Socket bridge stopped" << std::endl;
-            close(eis_sock);
-        });
-        bridge_thread.detach();
-        
-        // Run the EIS server event loop (adapted from hyprland-eis)
-        std::cout << "🚀 Starting EIS server event loop..." << std::endl;
-        
-        bool stop = false;
-        struct pollfd fds = {
-            .fd = eis_get_fd(eis_context),
-            .events = POLLIN,
-            .revents = 0,
-        };
-        
-        while (!stop) {
-            int nevents = poll(&fds, 1, 100); // Reduced timeout to 100ms for better responsiveness
-            if (nevents == -1) {
-                std::cerr << "EIS poll error: " << strerror(errno) << std::endl;
-                break;
+
+            // Whatever ended the loop (disconnect, shutdown, connect deadline, poll
+            // error), drop our refs while the client still exists, then the context.
+            {
+                std::unique_lock<std::mutex> input_lock;
+                if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
+                release_eis_conn(conn);
             }
-            
-            if (nevents == 0) continue; // timeout
-            
-            // Process all pending EIS events in one go - this is crucial for scroll
-            eis_dispatch(eis_context);
-            
-            // Handle ALL events in the queue immediately
-            struct eis_event* event;
-            int event_count = 0;
-            while ((event = eis_get_event(eis_context)) != nullptr) {
-                event_count++;
-                //std::cout << "🎯 EIS: Processing event " << event_count << " type=" << eis_event_get_type(event) << std::endl;
-                
-                // Handle EIS events and forward to virtual devices
-                handle_eis_event(event);
-                eis_event_unref(event);
-            }
-            
-            if (event_count > 0) {
-                std::cout << "📊 EIS: Processed " << event_count << " events in this cycle" << std::endl;
-            }
+
+            std::cout << "📡 EIS server thread stopped" << std::endl;
+            eis_unref(eis_context);
+        }).detach();
+    } catch (const std::system_error& e) {
+        std::cerr << "Failed to start EIS server thread: " << e.what() << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(eis_mtx);
+            --eis_threads;
         }
-        
-        std::cout << "📡 EIS server thread stopped" << std::endl;
-        unlink(socket_path); // Clean up socket file
+        eis_cv.notify_all();
         eis_unref(eis_context);
-        close(server_fd);
-    }).detach();
-    
-    // Return the client file descriptor to deskflow
+        close(client_fd);
+        reply_failed(call, "Failed to set up EIS");
+        return;
+    }
+
+    // Return the client file descriptor to deskflow. client_fd comes from libeis
+    // (eis_backend_fd_add_client); libeis keeps its own end. UnixFd adopts
+    // client_fd (no dup), the bus dups it into the reply, and UnixFd closes our
+    // copy when it goes out of scope after the reply is sent. client_fd must not
+    // be closed elsewhere.
+    sdbus::UnixFd unix_fd{client_fd, sdbus::adopt_fd};
     auto reply = call.createReply();
-    
-    // Create a unix file descriptor object and pass it to the client
-    sdbus::UnixFd unix_fd{client_fd};
     reply << unix_fd;
     reply.send();
-    
-    std::cout << "✅ ConnectToEIS completed - socket fd sent to deskflow" << std::endl;
-    std::cout << "🎯 Deskflow can now send EIS events through fd " << client_fd << std::endl;
-    std::cout << "📡 Proper EIS server thread is running with socket bridge" << std::endl;
+
+    std::cout << "✅ ConnectToEIS completed - EIS client fd sent to deskflow" << std::endl;
 }
 
-void Portal::handle_eis_event(struct eis_event* event) {
+void Portal::handle_eis_event(struct eis_event* event, EisConn& conn) {
+    std::unique_lock<std::mutex> input_lock;
+    if (libei_handler) input_lock = std::unique_lock<std::mutex>(libei_handler->input_mutex);
     enum eis_event_type type = eis_event_get_type(event);
     
     // Log all events for debugging
@@ -690,88 +849,173 @@ void Portal::handle_eis_event(struct eis_event* event) {
         case EIS_EVENT_CLIENT_CONNECT: {
             struct eis_client* client = eis_event_get_client(event);
             std::cout << "🔌 EIS: Client connected: " << eis_client_get_name(client) << std::endl;
-            
+
+            // The fd backend context has one client; refuse anything else.
+            if (conn.client) {
+                std::cerr << "EIS: unexpected second client; disconnecting it" << std::endl;
+                eis_client_disconnect(client);
+                break;
+            }
+            conn.client = client;
+
             // Accept the client connection
             eis_client_connect(client);
-            
-            // Add a seat for this client (required for devices)
-            struct eis_seat* seat = eis_client_new_seat(client, "hyprland-portal-seat");
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_POINTER);
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_POINTER_ABSOLUTE);
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_KEYBOARD);
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_BUTTON);
-            eis_seat_configure_capability(seat, EIS_DEVICE_CAP_SCROLL);
-            eis_seat_add(seat);
-            
+
+            // Add a seat for this client (required for devices). We keep the ref
+            // eis_client_new_seat returns until release_eis_conn().
+            conn.seat = eis_client_new_seat(client, "hyprland-portal-seat");
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_POINTER);
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_POINTER_ABSOLUTE);
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_KEYBOARD);
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_BUTTON);
+            eis_seat_configure_capability(conn.seat, EIS_DEVICE_CAP_SCROLL);
+            eis_seat_add(conn.seat);
+
             std::cout << "💺 EIS: Seat added for client with capabilities" << std::endl;
             break;
         }
-        
+
         case EIS_EVENT_CLIENT_DISCONNECT:
             std::cout << "🔌 EIS: Client disconnected" << std::endl;
+            // libeis has already dropped the seat (its devices are removed); the
+            // event still holds the client, so release our refs now.
+            if (eis_event_get_client(event) == conn.client) release_eis_conn(conn);
             break;
-            
+
         case EIS_EVENT_SEAT_BIND: {
             struct eis_seat* seat = eis_event_get_seat(event);
-            std::cout << "💺 EIS: Seat bound by client" << std::endl;
-            
-            // Add pointer device
-            struct eis_device* pointer = eis_seat_new_device(seat);
-            eis_device_configure_name(pointer, "Hyprland Portal Pointer");
-            eis_device_configure_capability(pointer, EIS_DEVICE_CAP_POINTER);
-            eis_device_configure_capability(pointer, EIS_DEVICE_CAP_POINTER_ABSOLUTE);
-            eis_device_configure_capability(pointer, EIS_DEVICE_CAP_BUTTON);
-            eis_device_configure_capability(pointer, EIS_DEVICE_CAP_SCROLL);
-            
-            // Set pointer region (screen size)
-            struct eis_region* region = eis_device_new_region(pointer);
-            eis_region_set_size(region, 1920, 1080); // TODO: Get actual screen size
-            eis_region_add(region);
-            
-            eis_device_add(pointer);
-            eis_device_resume(pointer);
-            
-            // Add keyboard device with proper keymap setup
-            struct eis_device* keyboard = eis_seat_new_device(seat);
-            eis_device_configure_name(keyboard, "Hyprland Portal Keyboard");
-            eis_device_configure_capability(keyboard, EIS_DEVICE_CAP_KEYBOARD);
-            
-            // Set up a basic keymap for proper modifier key handling
-            // This is crucial for key combinations like Meta+Enter to work
-            const char* keymap_str = 
-                "xkb_keymap {\n"
-                "xkb_keycodes  { include \"evdev+aliases(qwerty)\" };\n"
-                "xkb_types     { include \"complete\" };\n"
-                "xkb_compat    { include \"complete\" };\n"
-                "xkb_symbols   { include \"pc+us+inet(evdev)\" };\n"
-                "xkb_geometry  { include \"pc(pc105)\" };\n"
-                "};\n";
-                
-            // Create a memory file for the keymap
-            size_t keymap_size = strlen(keymap_str);
-            int memfd = memfd_create("keymap", MFD_CLOEXEC);
-            if (memfd >= 0) {
-                if (write(memfd, keymap_str, keymap_size) == (ssize_t)keymap_size) {
-                    struct eis_keymap* keymap = eis_device_new_keymap(keyboard, 
-                        EIS_KEYMAP_TYPE_XKB, memfd, keymap_size);
-                    if (keymap) {
-                        eis_keymap_add(keymap);
-                        std::cout << "🗝️ EIS: Keymap configured for proper modifier handling" << std::endl;
-                    }
-                }
-                close(memfd);
+            if (!conn.seat || seat != conn.seat) break;
+
+            const bool want_pointer =
+                eis_event_seat_has_capability(event, EIS_DEVICE_CAP_POINTER) ||
+                eis_event_seat_has_capability(event, EIS_DEVICE_CAP_POINTER_ABSOLUTE) ||
+                eis_event_seat_has_capability(event, EIS_DEVICE_CAP_BUTTON) ||
+                eis_event_seat_has_capability(event, EIS_DEVICE_CAP_SCROLL);
+            const bool want_keyboard = eis_event_seat_has_capability(event, EIS_DEVICE_CAP_KEYBOARD);
+
+            if (!want_pointer && !want_keyboard) {
+                // Unbind. libeis sends this (caps 0) when it drops the seat on
+                // disconnect; the seat is gone, so create nothing on it.
+                release_eis_device(conn.pointer);
+                release_eis_device(conn.keyboard);
+                std::cout << "💺 EIS: seat unbound; devices removed" << std::endl;
+                break;
             }
-            
-            eis_device_add(keyboard);
-            eis_device_resume(keyboard);
-            
-            std::cout << "🖱️ EIS: Pointer and keyboard devices added with enhanced features" << std::endl;
+
+            // A client that binds and leaves at once has its seat dropped (and a
+            // newer SEAT_BIND or the disconnect queued) before we see this bind.
+            // Devices made now would sit on a dead seat, so let that event decide.
+            {
+                struct eis_event* next = eis_peek_event(eis_client_get_context(eis_event_get_client(event)));
+                bool superseded = false;
+                if (next) {
+                    enum eis_event_type next_type = eis_event_get_type(next);
+                    superseded = next_type == EIS_EVENT_CLIENT_DISCONNECT ||
+                                 (next_type == EIS_EVENT_SEAT_BIND && eis_event_get_seat(next) == seat);
+                    eis_event_unref(next);
+                }
+                if (superseded) {
+                    std::cout << "💺 EIS: seat bind superseded by a queued event; skipped" << std::endl;
+                    break;
+                }
+            }
+
+            {
+                std::string caps;
+                auto add = [&](enum eis_device_capability c, const char* name) {
+                    if (!eis_event_seat_has_capability(event, c)) return;
+                    if (!caps.empty()) caps += ',';
+                    caps += name;
+                };
+                add(EIS_DEVICE_CAP_POINTER, "pointer");
+                add(EIS_DEVICE_CAP_POINTER_ABSOLUTE, "pointer-absolute");
+                add(EIS_DEVICE_CAP_BUTTON, "button");
+                add(EIS_DEVICE_CAP_SCROLL, "scroll");
+                add(EIS_DEVICE_CAP_KEYBOARD, "keyboard");
+                std::cout << "💺 EIS: seat bind caps=" << caps << std::endl;
+            }
+
+            // A capability the client no longer binds: drop its device.
+            if (!want_pointer) release_eis_device(conn.pointer);
+            if (!want_keyboard) release_eis_device(conn.keyboard);
+
+            if (want_pointer && !conn.pointer) {
+                // We keep the ref eis_seat_new_device returns, in conn.
+                struct eis_device* pointer = eis_seat_new_device(seat);
+                conn.pointer = pointer;
+                eis_device_configure_name(pointer, "Hyprland Portal Pointer");
+                eis_device_configure_capability(pointer, EIS_DEVICE_CAP_POINTER);
+                eis_device_configure_capability(pointer, EIS_DEVICE_CAP_POINTER_ABSOLUTE);
+                eis_device_configure_capability(pointer, EIS_DEVICE_CAP_BUTTON);
+                eis_device_configure_capability(pointer, EIS_DEVICE_CAP_SCROLL);
+
+                // Set pointer region (screen size). eis_region_add gives the
+                // device its own ref, so ours goes right after.
+                struct eis_region* region = eis_device_new_region(pointer);
+                if (region) {
+                    Layout layout = current_layout(true);
+                    eis_region_set_size(region, static_cast<uint32_t>(layout.width), static_cast<uint32_t>(layout.height));
+                    std::cout << "EIS: Pointer region " << layout.width << "x" << layout.height
+                              << " across " << layout.monitors.size() << " monitor(s)" << std::endl;
+                    eis_region_add(region);
+                    eis_region_unref(region);
+                }
+
+                eis_device_add(pointer);
+                eis_device_resume(pointer);
+                std::cout << "🖱️ EIS: Pointer device added" << std::endl;
+            }
+
+            if (want_keyboard && !conn.keyboard) {
+                struct eis_device* keyboard = eis_seat_new_device(seat);
+                conn.keyboard = keyboard;
+                eis_device_configure_name(keyboard, "Hyprland Portal Keyboard");
+                eis_device_configure_capability(keyboard, EIS_DEVICE_CAP_KEYBOARD);
+
+                // Set up a basic keymap for proper modifier key handling
+                // This is crucial for key combinations like Meta+Enter to work
+                const char* keymap_str =
+                    "xkb_keymap {\n"
+                    "xkb_keycodes  { include \"evdev+aliases(qwerty)\" };\n"
+                    "xkb_types     { include \"complete\" };\n"
+                    "xkb_compat    { include \"complete\" };\n"
+                    "xkb_symbols   { include \"pc+us+inet(evdev)\" };\n"
+                    "xkb_geometry  { include \"pc(pc105)\" };\n"
+                    "};\n";
+
+                // Create a memory file for the keymap. libeis dups the fd; the
+                // dup lives as long as the keymap, which the device owns once
+                // eis_keymap_add has run, so ours goes right after.
+                size_t keymap_size = strlen(keymap_str);
+                int memfd = memfd_create("keymap", MFD_CLOEXEC);
+                if (memfd >= 0) {
+                    if (write(memfd, keymap_str, keymap_size) == (ssize_t)keymap_size) {
+                        struct eis_keymap* keymap = eis_device_new_keymap(keyboard,
+                            EIS_KEYMAP_TYPE_XKB, memfd, keymap_size);
+                        if (keymap) {
+                            eis_keymap_add(keymap);
+                            eis_keymap_unref(keymap);
+                            std::cout << "🗝️ EIS: Keymap configured for proper modifier handling" << std::endl;
+                        }
+                    }
+                    close(memfd);
+                }
+
+                eis_device_add(keyboard);
+                eis_device_resume(keyboard);
+                std::cout << "⌨️ EIS: Keyboard device added" << std::endl;
+            }
             break;
         }
         
         case EIS_EVENT_DEVICE_START_EMULATING: {
             struct eis_device* device = eis_event_get_device(event);
             std::cout << "🎮 EIS: Device started emulating: " << eis_device_get_name(device) << std::endl;
+            g_current_monitor = -1; // cursor (re)entered this screen
+            // Pick up monitor changes here, not during motion. (The pointer region
+            // size is still fixed at SEAT_BIND; that limitation is unchanged.)
+            current_layout(true);
+            g_abs.have_prev = false;
             break;
         }
         
@@ -785,7 +1029,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
             double dx = eis_event_pointer_get_dx(event);
             double dy = eis_event_pointer_get_dy(event);
             
-            std::cout << "🖱️ EIS: Pointer motion dx=" << dx << " dy=" << dy << std::endl;
             
             // Forward to virtual pointer
             if (libei_handler && libei_handler->pointer) {
@@ -793,7 +1036,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                 libei_handler->pointer->send_motion(time, dx, dy);
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Motion forwarded to virtual pointer" << std::endl;
             }
             break;
         }
@@ -801,17 +1043,19 @@ void Portal::handle_eis_event(struct eis_event* event) {
         case EIS_EVENT_POINTER_MOTION_ABSOLUTE: {
             double x = eis_event_pointer_get_absolute_x(event);
             double y = eis_event_pointer_get_absolute_y(event);
+            if (!std::isfinite(x) || !std::isfinite(y)) break;
             
-            std::cout << "🖱️ EIS: Pointer absolute motion x=" << x << " y=" << y << std::endl;
             
             // Forward to virtual pointer  
             if (libei_handler && libei_handler->pointer) {
                 uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
-                libei_handler->pointer->send_motion_absolute(time, 
-                    static_cast<uint32_t>(x), static_cast<uint32_t>(y), 1920, 1080);
+                Layout layout = current_layout();
+                track_absolute(layout, x, y);
+                libei_handler->pointer->send_motion_absolute(time,
+                    static_cast<uint32_t>(std::lround(x)), static_cast<uint32_t>(std::lround(y)),
+                    static_cast<uint32_t>(layout.width), static_cast<uint32_t>(layout.height));
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Absolute motion forwarded to virtual pointer" << std::endl;
             }
             break;
         }
@@ -820,7 +1064,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
             uint32_t button = eis_event_button_get_button(event);
             bool is_press = eis_event_button_get_is_press(event);
             
-            std::cout << "🖱️ EIS: Button " << (is_press ? "press" : "release") << " button=" << button << std::endl;
             
             // Forward to virtual pointer
             if (libei_handler && libei_handler->pointer) {
@@ -828,7 +1071,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                 libei_handler->pointer->send_button(time, button, is_press ? 1 : 0);
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Button event forwarded to virtual pointer" << std::endl;
             }
             break;
         }
@@ -837,18 +1079,14 @@ void Portal::handle_eis_event(struct eis_event* event) {
             double dx = eis_event_scroll_get_dx(event);
             double dy = eis_event_scroll_get_dy(event);
             
-            std::cout << "🖱️ EIS: Scroll delta dx=" << dx << " dy=" << dy << std::endl;
             
             // Debug: Check if we have the required components
-            std::cout << "🔍 DEBUG: libei_handler=" << (libei_handler ? "YES" : "NO") 
-                      << ", pointer=" << (libei_handler && libei_handler->pointer ? "YES" : "NO") << std::endl;
             
             // Forward to virtual pointer with proper Wayland scroll protocol
             if (libei_handler && libei_handler->pointer) {
                 uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                 
-                std::cout << "🎯 Sending scroll events with time=" << time << std::endl;
                 
                 // Set axis source - wheel is the most common source for EIS scroll events
                 libei_handler->pointer->send_axis_source(WL_POINTER_AXIS_SOURCE_WHEEL);
@@ -857,21 +1095,16 @@ void Portal::handle_eis_event(struct eis_event* event) {
                 double scale_factor = 15.0; // Good default for smooth scrolling
                 
                 if (dx != 0.0) {
-                    std::cout << "🔄 Sending horizontal scroll: " << (dx * scale_factor) << std::endl;
-                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx * scale_factor, dy);
+                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, dx * scale_factor);
                     // Send axis stop to complete the scroll event
                     libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_HORIZONTAL_SCROLL);
                 }
                 if (dy != 0.0) {
-                    std::cout << "🔄 Sending vertical scroll: " << (dy * scale_factor) << std::endl;
-                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dx * scale_factor, dy);
+                    libei_handler->pointer->send_axis(time, WL_POINTER_AXIS_VERTICAL_SCROLL, dy * scale_factor);
                     // Send axis stop to complete the scroll event  
                     libei_handler->pointer->send_axis_stop(time, WL_POINTER_AXIS_VERTICAL_SCROLL);
                 }
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Scroll delta forwarded with proper axis protocol" << std::endl;
-            } else {
-                std::cout << "❌ Cannot forward scroll - missing virtual pointer!" << std::endl;
             }
             break;
         }
@@ -887,7 +1120,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
                 //std::cout << "🔄 Discrete values are 0, assuming vertical scroll step: dy=" << dy << std::endl;
             }
 
-            std::cout << "🖱️ EIS: Scroll discrete dx=" << dx << " dy=" << dy << std::endl;
             
             // If discrete values are 0, assume vertical scroll with 1 step (common case)
                         
@@ -906,9 +1138,6 @@ void Portal::handle_eis_event(struct eis_event* event) {
                 // libei_handler->pointer->send_axis_stop(time, axis);
             
                 libei_handler->pointer->send_frame();
-                std::cout << "✅ Scroll discrete forwarded (steps=" << dx << "," << dy << ")" << std::endl;
-            } else {
-                std::cout << "❌ No scroll to forward (dx=" << dx << " dy=" << dy << ") or no pointer available" << std::endl;
             }
             break;
         }
@@ -917,24 +1146,18 @@ void Portal::handle_eis_event(struct eis_event* event) {
             uint32_t keycode = eis_event_keyboard_get_key(event);
             bool is_press = eis_event_keyboard_get_key_is_press(event);
             
-            std::cout << "⌨️ EIS: Keyboard " << (is_press ? "press" : "release") << " keycode=" << keycode << std::endl;
             
             // Debug: Check if we have the required components
-            std::cout << "🔍 DEBUG: libei_handler=" << (libei_handler ? "YES" : "NO") 
-                      << ", keyboard=" << (libei_handler && libei_handler->keyboard ? "YES" : "NO") << std::endl;
             
             // Forward to virtual keyboard with immediate modifier updates
             if (libei_handler && libei_handler->keyboard) {
                 uint32_t time = static_cast<uint32_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now().time_since_epoch()).count());
                     
-                std::cout << "🎯 Processing key event with time=" << time << std::endl;
                 
                 // Update modifier state BEFORE sending the key event (using raw keycode)
                 update_modifier_state(keycode, is_press);
                 
-                std::cout << "🔧 Current modifier state: depressed=" << modifier_state_depressed 
-                         << ", latched=" << modifier_state_latched << ", locked=" << modifier_state_locked << std::endl;
                 
                 // Send modifier state first - this is crucial for key combinations like Meta+Enter
                 libei_handler->keyboard->send_modifiers(modifier_state_depressed, 
@@ -951,17 +1174,12 @@ void Portal::handle_eis_event(struct eis_event* event) {
                                                       modifier_state_locked, 
                                                       modifier_state_group);
                                                       
-                std::cout << "✅ Key " << keycode << " (" << (is_press ? "pressed" : "released") 
-                         << ") forwarded with modifier state: " << modifier_state_depressed << std::endl;
-            } else {
-                std::cout << "❌ Cannot forward key - missing virtual keyboard!" << std::endl;
             }
             break;
         }
         
         case EIS_EVENT_FRAME:
-            // Frame events group related events together - just log for now
-            std::cout << "📸 EIS: Frame event" << std::endl;
+            // Frame events group related events together; nothing to do
             break;
             
         default:
@@ -981,35 +1199,30 @@ void Portal::update_modifier_state(uint32_t keycode, bool is_press) {
         case 54:  // Shift_R (raw keycode 54)
             is_modifier = true;
             modifier_mask = MOD_SHIFT;
-            std::cout << "🔧 Detected SHIFT key: " << keycode << std::endl;
             break;
             
         case 29:  // Control_L (raw keycode 29)
         case 97:  // Control_R (raw keycode 97)
             is_modifier = true;
             modifier_mask = MOD_CTRL;
-            std::cout << "🔧 Detected CTRL key: " << keycode << std::endl;
             break;
             
         case 56:  // Alt_L (raw keycode 56)
         case 100: // Alt_R (raw keycode 100)
             is_modifier = true;
             modifier_mask = MOD_ALT;
-            std::cout << "🔧 Detected ALT key: " << keycode << std::endl;
             break;
             
         case 125: // Super_L (raw keycode 125) - Meta/Windows key
         case 126: // Super_R (raw keycode 126)
             is_modifier = true;
             modifier_mask = MOD_META;
-            std::cout << "🔧 Detected META/SUPER key: " << keycode << std::endl;
             break;
             
         case 58:  // Caps_Lock (raw keycode 58)
             // Caps lock is special - toggle on press only
             if (is_press) {
                 modifier_state_locked ^= MOD_CAPS; // Toggle caps lock state
-                std::cout << "🔒 Caps Lock toggled: " << (modifier_state_locked & MOD_CAPS ? "ON" : "OFF") << std::endl;
             }
             return;
             
@@ -1017,7 +1230,6 @@ void Portal::update_modifier_state(uint32_t keycode, bool is_press) {
             // Num lock is special - toggle on press only
             if (is_press) {
                 modifier_state_locked ^= MOD_NUM; // Toggle num lock state
-                std::cout << "🔢 Num Lock toggled: " << (modifier_state_locked & MOD_NUM ? "ON" : "OFF") << std::endl;
             }
             return;
     }
@@ -1025,12 +1237,221 @@ void Portal::update_modifier_state(uint32_t keycode, bool is_press) {
     if (is_modifier) {
         if (is_press) {
             modifier_state_depressed |= modifier_mask;
-            std::cout << "🔧 Modifier pressed: " << modifier_mask << " (state: " << modifier_state_depressed << ")" << std::endl;
         } else {
             modifier_state_depressed &= ~modifier_mask;
-            std::cout << "🔧 Modifier released: " << modifier_mask << " (state: " << modifier_state_depressed << ")" << std::endl;
         }
-    } else {
-        std::cout << "🔍 Non-modifier key: " << keycode << std::endl;
     }
-} 
+}
+
+// ---- org.freedesktop.impl.portal.Session ------------------------------------
+
+void Portal::export_session(const sdbus::ObjectPath& session_handle) {
+    const std::string handle = session_handle;
+    // Objects are created and destroyed outside sessions_mtx.
+    std::unique_ptr<sdbus::IObject> old;
+    std::vector<std::unique_ptr<sdbus::IObject>> closed;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        closed.swap(retired);
+        auto it = sessions.find(handle);
+        if (it != sessions.end()) old = std::move(it->second.obj);
+    }
+    old.reset();
+    closed.clear();
+
+    try {
+        auto obj = sdbus::createObject(*connection, session_handle);
+        obj->addVTable(
+            sdbus::MethodVTableItem{sdbus::MethodName{"Close"}, sdbus::Signature{""}, {}, sdbus::Signature{""}, {}, [this, handle](sdbus::MethodCall call) { SessionClose(std::move(call), handle); }, {}},
+            sdbus::SignalVTableItem{sdbus::SignalName{"Closed"}, sdbus::Signature{""}, {}, {}},
+            sdbus::PropertyVTableItem{sdbus::PropertyName{"version"}, sdbus::Signature{"u"}, [](sdbus::PropertyGetReply& reply) { reply << (uint32_t)1; }, {}, {}}
+        ).forInterface(sdbus::InterfaceName{SESSION_INTERFACE});
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        sessions[handle].obj = std::move(obj);
+    } catch (const sdbus::Error& e) {
+        std::cerr << "Failed to export Session object at " << handle << ": " << e.what() << std::endl;
+    }
+}
+
+void Portal::SessionClose(sdbus::MethodCall call, const std::string& session_handle) {
+    call.createReply().send();
+
+    bool was_clipboard_session = false;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        auto it = sessions.find(session_handle);
+        if (it != sessions.end()) {
+            // Can't destroy an object inside its own callback: retire it.
+            if (it->second.obj) retired.push_back(std::move(it->second.obj));
+            sessions.erase(it);
+        }
+        if (clip_session == session_handle) {
+            clip_session.clear();
+            was_clipboard_session = true;
+        }
+    }
+    std::cout << "Session closed: " << session_handle << std::endl;
+    if (was_clipboard_session && clipboard) clipboard->session_ended();
+}
+
+// ---- org.freedesktop.impl.portal.Clipboard ----------------------------------
+
+bool Portal::is_clip_session(const std::string& session_handle) {
+    if (!clipboard || !clipboard->available()) return false;
+    std::lock_guard<std::mutex> lock(sessions_mtx);
+    return clip_session == session_handle;
+}
+
+void Portal::RequestClipboard(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    std::map<std::string, sdbus::Variant> options;
+    try {
+        call >> session_handle >> options;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        sessions[session_handle].clipboard_requested = true;
+    }
+    std::cout << "clipboard requested for session " << session_handle << std::endl;
+    call.createReply().send();
+}
+
+void Portal::SetSelection(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    std::map<std::string, sdbus::Variant> options;
+    try {
+        call >> session_handle >> options;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    if (!is_clip_session(session_handle)) {
+        reply_failed(call, "Clipboard not enabled for this session");
+        return;
+    }
+    std::vector<std::string> mimes;
+    auto it = options.find("mime_types");
+    if (it != options.end()) {
+        try {
+            mimes = it->second.get<std::vector<std::string>>();
+        } catch (const sdbus::Error&) {
+            reply_failed(call, "mime_types must be of type as");
+            return;
+        }
+    }
+    mimes.erase(std::remove(mimes.begin(), mimes.end(), std::string(kOwnedMarker)), mimes.end());
+    std::cout << "clipboard: SetSelection with " << mimes.size() << " type(s)" << std::endl;
+    if (!mimes.empty()) clipboard->claim(std::move(mimes));
+    call.createReply().send();
+}
+
+void Portal::SelectionWrite(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    uint32_t serial = 0;
+    try {
+        call >> session_handle >> serial;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    if (!is_clip_session(session_handle)) {
+        reply_failed(call, "Clipboard not enabled for this session");
+        return;
+    }
+    int fd = clipboard->take_write_fd(serial);
+    if (fd < 0) {
+        reply_failed(call, "Unknown or expired serial");
+        return;
+    }
+    // adopt_fd: the UnixFd owns our copy and closes it after the reply (Types.h:329).
+    sdbus::UnixFd unix_fd{fd, sdbus::adopt_fd};
+    auto reply = call.createReply();
+    reply << unix_fd;
+    reply.send();
+}
+
+void Portal::SelectionWriteDone(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    uint32_t serial = 0;
+    bool success = false;
+    try {
+        call >> session_handle >> serial >> success;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    if (!is_clip_session(session_handle)) {
+        reply_failed(call, "Clipboard not enabled for this session");
+        return;
+    }
+    clipboard->write_done(serial, success);
+    call.createReply().send();
+}
+
+void Portal::SelectionRead(sdbus::MethodCall call) {
+    sdbus::ObjectPath session_handle;
+    std::string mime_type;
+    try {
+        call >> session_handle >> mime_type;
+    } catch (const sdbus::Error&) {
+        reply_failed(call, "Invalid arguments");
+        return;
+    }
+    if (!is_clip_session(session_handle)) {
+        reply_failed(call, "Clipboard not enabled for this session");
+        return;
+    }
+    int fd = clipboard->open_read(mime_type);
+    if (fd < 0) {
+        reply_failed(call, "MIME type not offered by the current selection");
+        return;
+    }
+    sdbus::UnixFd unix_fd{fd, sdbus::adopt_fd};
+    auto reply = call.createReply();
+    reply << unix_fd;
+    reply.send();
+}
+
+// Called on the Wayland thread with no WaylandClipboard lock held. Emitting is
+// thread-safe (IObject.h:57-59); we never emit while holding sessions_mtx.
+void Portal::emit_owner_changed(const std::vector<std::string>& mimes) {
+    std::string session;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        session = clip_session;
+    }
+    if (session.empty() || !object) return;
+    try {
+        std::map<std::string, sdbus::Variant> options;
+        options["mime_types"] = sdbus::Variant(mimes);
+        options["session_is_owner"] = sdbus::Variant(false);
+        auto signal = object->createSignal(sdbus::InterfaceName{CLIPBOARD_INTERFACE},
+                                           sdbus::SignalName{"SelectionOwnerChanged"});
+        signal << sdbus::ObjectPath{session} << options;
+        object->emitSignal(signal);
+    } catch (const sdbus::Error& e) {
+        std::cerr << "clipboard: SelectionOwnerChanged failed: " << e.what() << std::endl;
+    }
+}
+
+bool Portal::emit_transfer(const std::string& mime, uint32_t serial) {
+    std::string session;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mtx);
+        session = clip_session;
+    }
+    if (session.empty() || !object) return false;
+    try {
+        auto signal = object->createSignal(sdbus::InterfaceName{CLIPBOARD_INTERFACE},
+                                           sdbus::SignalName{"SelectionTransfer"});
+        signal << sdbus::ObjectPath{session} << mime << serial;
+        object->emitSignal(signal);
+        return true;
+    } catch (const sdbus::Error& e) {
+        std::cerr << "clipboard: SelectionTransfer failed: " << e.what() << std::endl;
+        return false;
+    }
+}

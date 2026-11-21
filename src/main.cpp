@@ -2,22 +2,29 @@
 #include "wayland_virtual_keyboard.h"
 #include "wayland_virtual_pointer.h"
 #include "libei_handler.h"
+#include "clipboard.h"
 #include <iostream>
 #include <thread>
 #include <signal.h>
+#include <csignal>
 #include <chrono>
 
-static bool running = true;
+static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t received_signal = 0;
 
+// Async-signal-safe: only store the flags, no I/O.
 void signal_handler(int signal) {
-    std::cout << "\nReceived signal " << signal << ", shutting down..." << std::endl;
-    running = false;
+    received_signal = signal;
+    running = 0;
 }
 
 int main(int argc, char* argv[]) {
     // Set up signal handling
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    // Writes to a socket or pipe whose reader has gone must fail with EPIPE,
+    // not kill the portal (EIS bridge, clipboard fds).
+    signal(SIGPIPE, SIG_IGN);
     
     std::cout << "Hyprland Remote Desktop Portal starting..." << std::endl;
     
@@ -26,6 +33,8 @@ int main(int argc, char* argv[]) {
     WaylandVirtualPointer waylandVP;
     LibEIHandler libeiHandler;
     Portal portal;
+    // Declared after portal so that it is destroyed (and its thread stopped) first.
+    WaylandClipboard clipboard;
     
     // Initialize Wayland virtual keyboard
     if (!waylandVK.init()) {
@@ -58,9 +67,12 @@ int main(int argc, char* argv[]) {
     
     std::cout << "✓ LibEI handler started and ready for connections" << std::endl;
     
-    // Initialize portal
-    if (!portal.init(&libeiHandler)) {
+    // Initialize portal; it also initializes the clipboard (clipboard.h, item 9)
+    if (!portal.init(&libeiHandler, &clipboard)) {
         std::cerr << "Failed to initialize D-Bus portal" << std::endl;
+        // libei_thread is joinable here; destroying it would call std::terminate.
+        libeiHandler.stop();
+        libei_thread.join();
         libeiHandler.cleanup();
         waylandVP.cleanup();
         waylandVK.cleanup();
@@ -82,6 +94,7 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     
+    std::cout << "\nReceived signal " << static_cast<int>(received_signal) << ", shutting down..." << std::endl;
     std::cout << "\nShutting down components..." << std::endl;
     
     // Stop and cleanup
@@ -89,6 +102,10 @@ int main(int argc, char* argv[]) {
     if (portal_thread.joinable()) {
         portal_thread.join();
     }
+    
+    // The clipboard thread emits signals on portal's object, so stop it before
+    // portal.cleanup() destroys that object.
+    clipboard.stop();
     
     libeiHandler.stop();
     if (libei_thread.joinable()) {
